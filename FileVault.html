@@ -1,0 +1,3283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>FileVault — Local File Manager</title>
+<style>
+/* ================================================================
+   RESET + TOKENS
+================================================================ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* "Aurora" theme — deep indigo base, vivid teal accent (2026-06-12) */
+  --bg-0:   #0b0d1a;
+  --bg-1:   #10142b;
+  --bg-2:   #181d3a;
+  --bg-3:   #232a52;
+  --bg-4:   #2f3868;
+  --gold:   #2dd4bf;             /* primary accent (teal) — keeps legacy var name */
+  --gold-l: #5eead4;
+  --gold-d: rgba(45,212,191,.14);
+  --gold-b: rgba(45,212,191,.34);
+  --txt-1:  #eef1ff;
+  --txt-2:  #c0c8ea;
+  --txt-3:  #97a0c8;
+  --txt-4:  #6f78a3;
+  --bdr:    #2b3160;
+  --bdr-2:  #3a4180;
+  --green:  #4ade80;
+  --red:    #fb7185;
+  --blue:   #60a5fa;
+  --orange: #fbbf24;
+  --r:      6px;
+  --r-md:   10px;
+  --r-lg:   16px;
+  --t:      .15s ease;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+  background: var(--bg-1);
+  color: var(--txt-1);
+  height: 100vh;
+  overflow: hidden;
+  font-size: 14px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg-2); border-radius: 5px; }
+::-webkit-scrollbar-thumb { background: var(--bg-4); border-radius: 5px; border: 2px solid var(--bg-2); }
+::-webkit-scrollbar-thumb:hover { background: var(--gold); border-color: var(--bg-2); }
+::-webkit-scrollbar-corner { background: var(--bg-2); }
+
+/* ================================================================
+   LOADING BAR
+================================================================ */
+#loadBar {
+  position: fixed; top: 0; left: 0; height: 2px; width: 0; z-index: 9999;
+  background: linear-gradient(90deg, #2dd4bf, #818cf8, #f472b6);
+  border-radius: 0 2px 2px 0;
+  transition: width .3s ease, opacity .3s ease;
+}
+
+/* ================================================================
+   HEADER
+================================================================ */
+header {
+  background: linear-gradient(180deg, rgba(24,29,58,.98), rgba(16,20,43,.97));
+  border-bottom: 1px solid var(--bdr);
+  padding: 0 18px;
+  height: 54px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  z-index: 100;
+}
+
+.brand {
+  display: flex; align-items: center; gap: 9px;
+}
+.brand-icon {
+  width: 30px; height: 30px;
+  background: linear-gradient(135deg, var(--gold) 0%, #ff8c00 100%);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px;
+  box-shadow: 0 2px 8px rgba(45,212,191,.35);
+  flex-shrink: 0;
+}
+.brand-name {
+  font-size: 15px; font-weight: 700; color: var(--gold-l); letter-spacing: -.2px;
+}
+.brand-name em { font-style: normal; color: var(--txt-3); font-weight: 400; font-size: 12px; margin-left: 4px; }
+
+.path-pill {
+  flex: 1; max-width: 520px; margin: 0 14px;
+  background: var(--bg-3); border: 1px solid var(--bdr);
+  border-radius: var(--r); padding: 5px 11px;
+  font-size: 12px; color: var(--txt-3);
+  font-family: 'SF Mono', 'Menlo', monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: default; user-select: none;
+}
+/* Selected-file full path pill — shown in header when exactly 1 file is selected */
+.sel-path-pill {
+  flex: 1; max-width: 480px; margin: 0 0 0 8px;
+  background: rgba(45,212,191,.10); border: 1px solid var(--gold-b);
+  border-radius: var(--r); padding: 5px 11px;
+  font-size: 11px; color: var(--gold-l);
+  font-family: 'SF Mono', 'Menlo', monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: default; user-select: text;
+  display: none; /* hidden until 1 file is selected */
+}
+
+.hdr-btns { display: flex; align-items: center; gap: 7px; }
+.root-path-input {
+  flex: 1; max-width: 380px; margin: 0 8px 0 0;
+  background: var(--bg-3); border: 1px solid var(--bdr);
+  border-radius: var(--r); padding: 5px 11px;
+  font-size: 11px; color: var(--txt-3);
+  font-family: 'SF Mono', 'Menlo', monospace;
+  outline: none; display: none;
+}
+.root-path-input::placeholder { color: var(--txt-4); }
+.root-path-input:focus { border-color: var(--gold-b); color: var(--txt-1); }
+
+/* ================================================================
+   BUTTONS
+================================================================ */
+.btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 13px; border-radius: var(--r);
+  font-size: 13px; font-weight: 500; font-family: inherit;
+  border: 1px solid transparent; cursor: pointer;
+  transition: all var(--t); white-space: nowrap; line-height: 1;
+}
+.btn:active { transform: scale(.97); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn:disabled:active { transform: none; }
+
+.btn-primary { background: var(--gold); color: #000; border-color: var(--gold); }
+.btn-primary:hover:not(:disabled) { background: var(--gold-l); }
+
+.btn-ghost { background: transparent; color: var(--txt-3); border-color: transparent; }
+.btn-ghost:hover { background: var(--bg-3); color: var(--txt-1); }
+
+.btn-sec { background: var(--bg-3); color: var(--txt-2); border-color: var(--bdr); }
+.btn-sec:hover:not(:disabled) { background: var(--bg-4); border-color: var(--bdr-2); color: var(--txt-1); }
+
+.btn-danger { background: rgba(218,54,51,.15); color: #ff7775; border-color: rgba(218,54,51,.3); }
+.btn-danger:hover:not(:disabled) { background: rgba(218,54,51,.25); }
+
+.btn-ok { background: rgba(46,160,67,.15); color: #56d364; border-color: rgba(46,160,67,.3); }
+.btn-ok:hover:not(:disabled) { background: rgba(46,160,67,.25); }
+
+.btn-sq { padding: 6px; width: 30px; height: 30px; justify-content: center; font-size: 14px; }
+
+/* ================================================================
+   LAYOUT
+================================================================ */
+.workspace { display: flex; flex: 1; overflow: hidden; }
+
+/* Sidebar */
+.sidebar {
+  width: 210px; flex-shrink: 0;
+  background: var(--bg-2); border-right: 1px solid var(--bdr);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.sidebar-hdr {
+  padding: 14px 14px 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase;
+  color: var(--txt-4);
+}
+.sidebar-scroll { flex: 1; overflow-y: auto; padding: 0 6px 12px; }
+
+.type-row {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 8px; border-radius: var(--r); cursor: pointer;
+  transition: all var(--t); border: 1px solid transparent;
+}
+.type-row:hover { background: var(--bg-3); }
+.type-row.active { background: var(--gold-d); border-color: var(--gold-b); }
+
+.type-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.type-label { flex: 1; font-size: 12.5px; color: var(--txt-2); font-weight: 500; }
+.type-row.active .type-label { color: var(--gold-l); }
+.type-chip {
+  font-size: 10.5px; color: var(--txt-4); background: var(--bg-3);
+  padding: 1px 6px; border-radius: 10px; font-weight: 600; flex-shrink: 0;
+}
+.type-row.active .type-chip { background: var(--gold-d); color: var(--gold); }
+
+.sidebar-div { height: 1px; background: var(--bdr); margin: 6px 8px; }
+
+/* File Area */
+.file-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* Toolbar */
+.toolbar {
+  padding: 10px 14px; display: flex; align-items: center; gap: 9px;
+  border-bottom: 1px solid var(--bdr); background: var(--bg-2); flex-shrink: 0;
+}
+
+.search-wrap { position: relative; flex: 1; max-width: 340px; }
+.search-ico { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); color: var(--txt-4); font-size: 13px; pointer-events: none; }
+.search-input {
+  width: 100%; background: var(--bg-3); border: 1px solid var(--bdr);
+  border-radius: var(--r); padding: 6px 30px 6px 30px;
+  font-size: 13px; color: var(--txt-1); outline: none; font-family: inherit;
+  transition: border-color var(--t);
+}
+.search-clear {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; border: none; border-radius: 50%;
+  background: var(--bg-4); color: var(--txt-2); font-size: 11px; line-height: 1;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  padding: 0; transition: background var(--t), color var(--t);
+}
+.search-clear:hover { background: var(--gold); color: var(--bg-0); }
+.search-input:focus { border-color: var(--gold); box-shadow: 0 0 0 3px var(--gold-d); }
+.search-input::placeholder { color: var(--txt-4); }
+
+.toolbar-right { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.view-btn.active { background: var(--gold-d) !important; color: var(--gold-l) !important; border-color: var(--gold-b) !important; }
+
+/* Stats bar */
+.stats-bar {
+  padding: 5px 14px; font-size: 11.5px; color: var(--txt-4);
+  border-bottom: 1px solid var(--bdr); display: flex; align-items: center; gap: 14px;
+  background: var(--bg-1); flex-shrink: 0;
+}
+.stats-bar .s { display: flex; align-items: center; gap: 4px; }
+.stats-filtered { margin-left: auto; color: var(--gold); font-weight: 500; }
+
+/* File table */
+.file-table-wrap { flex: 1; overflow: auto; }
+.file-table { width: 100%; border-collapse: collapse; }
+.file-table thead { position: sticky; top: 0; z-index: 10; }
+.file-table th {
+  background: var(--bg-2); border-bottom: 1px solid var(--bdr);
+  padding: 8px 10px; text-align: left;
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+  color: var(--txt-4); cursor: pointer; user-select: none; white-space: nowrap;
+}
+.file-table th:hover { color: var(--txt-2); }
+.file-table th:first-child { width: 36px; padding-left: 14px; }
+.file-table td { padding: 9px 10px; border-bottom: 1px solid rgba(48,54,61,.45); font-size: 13px; vertical-align: middle; }
+.file-table td:first-child { padding-left: 14px; }
+.file-table tbody tr { transition: background var(--t); cursor: default; }
+.file-table tbody tr:hover { background: var(--bg-2); }
+.file-table tbody tr.sel { background: var(--gold-d); }
+.file-table tbody tr.sel:hover { background: rgba(45,212,191,.18); }
+/* Row currently shown in the preview pane — bright tint + left accent bar.
+   Uses !important and targets td so it always beats tr:hover / tr.sel,
+   regardless of selection state or render order. */
+.file-table tbody tr.previewing td { background: rgba(129,140,248,.30) !important; }
+.file-table tbody tr.previewing:hover td { background: rgba(129,140,248,.40) !important; }
+.file-table tbody tr.previewing td:first-child {
+  box-shadow: inset 5px 0 0 0 #818cf8 !important;
+}
+.file-table tbody tr:last-child td { border-bottom: none; }
+
+.f-name-cell { display: flex; align-items: center; gap: 9px; }
+.f-icon { font-size: 17px; line-height: 1; flex-shrink: 0; width: 22px; text-align: center; }
+.f-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 380px; font-weight: 500; color: var(--txt-1); }
+.f-badge {
+  font-size: 9.5px; padding: 2px 5px; border-radius: 4px;
+  font-weight: 700; letter-spacing: .3px; text-transform: uppercase; flex-shrink: 0;
+}
+.f-size { color: var(--txt-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.f-date { color: var(--txt-3); white-space: nowrap; font-size: 12px; }
+.f-type { color: var(--txt-4); font-size: 12px; }
+
+/* Checkbox */
+.cb {
+  appearance: none; -webkit-appearance: none;
+  width: 15px; height: 15px; border: 2px solid var(--bdr-2);
+  border-radius: 4px; cursor: pointer; background: var(--bg-3);
+  transition: all var(--t); position: relative; flex-shrink: 0;
+}
+.cb:checked { background: var(--gold); border-color: var(--gold); }
+.cb:checked::after {
+  content: '✓'; position: absolute; color: #000; font-size: 9px; font-weight: 800;
+  top: 50%; left: 50%; transform: translate(-50%, -50%);
+}
+.cb:hover { border-color: var(--gold); }
+
+/* Action bar */
+.action-bar {
+  background: var(--bg-2); border-top: 1px solid var(--bdr);
+  padding: 9px 14px; display: flex; align-items: center; gap: 7px;
+  flex-shrink: 0; transition: opacity var(--t), transform var(--t);
+}
+.action-bar.hidden { opacity: 0; pointer-events: none; transform: translateY(4px); }
+.sel-count { font-size: 13px; color: var(--gold-l); font-weight: 700; margin-right: 6px; }
+.act-div { width: 1px; height: 18px; background: var(--bdr); margin: 0 3px; }
+.act-spacer { flex: 1; }
+
+/* ================================================================
+   EMPTY / NO RESULTS
+================================================================ */
+.empty-wrap {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 14px; color: var(--txt-4); padding: 40px; text-align: center;
+}
+.empty-ico { font-size: 60px; opacity: .25; }
+.empty-title { font-size: 19px; font-weight: 600; color: var(--txt-3); }
+.empty-desc { font-size: 13.5px; max-width: 360px; line-height: 1.65; }
+
+/* ================================================================
+   MODAL
+================================================================ */
+.overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.72);
+  z-index: 500; display: flex; align-items: center; justify-content: center;
+  backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
+  opacity: 0; pointer-events: none; transition: opacity .2s ease;
+}
+.overlay.show { opacity: 1; pointer-events: all; }
+.modal {
+  background: var(--bg-2); border: 1px solid var(--bdr-2);
+  border-radius: var(--r-lg); padding: 26px;
+  width: 460px; max-width: 92vw;
+  box-shadow: 0 24px 64px rgba(0,0,0,.55);
+  transform: scale(.96) translateY(-10px);
+  transition: transform .2s ease;
+}
+.overlay.show .modal { transform: scale(1) translateY(0); }
+.modal-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+.modal-desc { font-size: 13px; color: var(--txt-3); line-height: 1.6; margin-bottom: 4px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+
+/* Help modal */
+.modal-help { width: 600px; max-height: 82vh; overflow-y: auto; }
+.help-sec { margin-bottom: 18px; }
+.help-sec h3 { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--gold-l); margin-bottom: 7px; }
+.help-sec p, .help-sec li { font-size: 13px; color: var(--txt-2); line-height: 1.7; }
+.help-sec ul { padding-left: 16px; }
+.help-sec li { margin-bottom: 3px; }
+kbd {
+  display: inline-block; padding: 1px 6px;
+  background: var(--bg-4); border: 1px solid var(--bdr-2);
+  border-radius: 4px; font-size: 11px; font-family: 'SF Mono','Menlo',monospace;
+  color: var(--txt-2);
+}
+
+/* Progress bar */
+.prog-track { background: var(--bg-4); border-radius: 4px; height: 7px; overflow: hidden; margin-top: 14px; }
+.prog-fill {
+  height: 100%; background: linear-gradient(90deg, var(--gold), #818cf8);
+  border-radius: 4px; transition: width .25s ease; width: 0%;
+}
+
+/* ================================================================
+   TOASTS
+================================================================ */
+#toasts {
+  position: fixed; bottom: 22px; right: 22px;
+  z-index: 9990; display: flex; flex-direction: column; gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  background: var(--bg-3); border: 1px solid var(--bdr-2);
+  border-radius: var(--r-md); padding: 11px 14px;
+  font-size: 13px; color: var(--txt-1);
+  box-shadow: 0 4px 20px rgba(0,0,0,.4);
+  display: flex; align-items: center; gap: 9px;
+  min-width: 260px; max-width: 380px;
+  animation: toastIn .28s ease; pointer-events: all;
+}
+.toast.success { border-left: 3px solid #3fb950; }
+.toast.error   { border-left: 3px solid #f85149; }
+.toast.info    { border-left: 3px solid #58a6ff; }
+.toast.warn    { border-left: 3px solid #e3b341; }
+@keyframes toastIn { from { transform: translateX(28px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+@keyframes toastOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(28px); opacity: 0; } }
+.toast.out { animation: toastOut .28s ease forwards; }
+
+/* Sort arrows */
+.srt { display: inline; margin-left: 3px; color: var(--gold); }
+.srt-off { color: var(--txt-4); }
+
+/* Scan warning */
+.scan-warn {
+  background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.3);
+  border-radius: var(--r); padding: 8px 12px; font-size: 12px; color: var(--orange);
+  margin: 10px 14px; flex-shrink: 0;
+}
+
+/* Depth input */
+.depth-row { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.depth-row label { font-size: 12px; color: var(--txt-3); }
+.depth-inp {
+  width: 56px; background: var(--bg-3); border: 1px solid var(--bdr);
+  border-radius: var(--r); padding: 4px 8px; font-size: 13px;
+  color: var(--txt-1); outline: none; font-family: inherit; text-align: center;
+}
+.depth-inp:focus { border-color: var(--gold); }
+
+/* Grid view */
+.file-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 12px; padding: 14px; flex: 1; align-content: start;
+}
+.grid-card {
+  background: var(--bg-2); border: 1px solid var(--bdr);
+  border-radius: var(--r-md); padding: 14px 10px;
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  cursor: default; transition: all var(--t); position: relative;
+}
+.grid-card:hover { background: var(--bg-3); border-color: var(--bdr-2); }
+.grid-card.sel { background: var(--gold-d); border-color: var(--gold-b); }
+.grid-ico { font-size: 38px; line-height: 1; }
+.grid-name {
+  font-size: 11.5px; color: var(--txt-2); text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  width: 100%; font-weight: 500;
+}
+.grid-ext { font-size: 10px; color: var(--txt-4); }
+.grid-cb { position: absolute; top: 7px; left: 7px; }
+
+/* ================================================================
+   PREVIEW PANEL
+================================================================ */
+.preview-panel {
+  width: 0; flex-shrink: 0;
+  background: var(--bg-2); border-left: 1px solid var(--bdr);
+  display: flex; flex-direction: column; overflow: hidden;
+  transition: width .25s ease;
+  /* small left inset so the preview's own scrollbar never sits flush against
+     the resize divider — makes both grabbable when they're side by side */
+  padding-left: 4px;
+}
+.preview-panel.open { width: 460px; }
+
+.prev-hdr {
+  padding: 11px 13px; border-bottom: 1px solid var(--bdr);
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+.prev-title {
+  flex: 1; font-size: 13px; font-weight: 600; color: var(--txt-1);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: text; border-radius: 4px; padding: 2px 5px; margin: -2px -3px;
+  transition: background var(--t), color var(--t);
+}
+.prev-title:hover { background: var(--gold-d); color: var(--gold-l); }
+.prev-title:hover::after { content: ' ✎'; opacity: .8; font-size: 11px; }
+.prev-meta {
+  padding: 9px 13px; border-bottom: 1px solid var(--bdr);
+  font-size: 12px; display: grid; grid-template-columns: auto 1fr;
+  gap: 4px 10px; flex-shrink: 0;
+}
+.prev-meta-k { color: var(--txt-4); white-space: nowrap; }
+.prev-meta-v { color: var(--txt-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prev-meta-v.wrap { white-space: normal; word-break: break-all; font-size: 11px; color: var(--txt-4); }
+
+.prev-content {
+  flex: 1; overflow: auto;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-0); padding: 14px;
+}
+/* Wide, easy-to-grab scrollbars everywhere inside the preview pane
+   (the inner document scrollbar used to be too thin to click). */
+.prev-content::-webkit-scrollbar,
+.prev-docx::-webkit-scrollbar,
+.prev-text::-webkit-scrollbar { width: 20px; height: 20px; }
+.prev-content::-webkit-scrollbar-track,
+.prev-docx::-webkit-scrollbar-track,
+.prev-text::-webkit-scrollbar-track { background: var(--bg-2); border-radius: 8px; }
+.prev-content::-webkit-scrollbar-thumb,
+.prev-docx::-webkit-scrollbar-thumb,
+.prev-text::-webkit-scrollbar-thumb { background: var(--bdr-2); border-radius: 8px; border: 3px solid var(--bg-2); }
+.prev-content::-webkit-scrollbar-thumb:hover,
+.prev-docx::-webkit-scrollbar-thumb:hover,
+.prev-text::-webkit-scrollbar-thumb:hover { background: var(--gold); }
+.prev-docx::-webkit-scrollbar-track { background: #e8e8e2; }
+.prev-docx::-webkit-scrollbar-thumb { border-color: #e8e8e2; background: #b9bdc7; }
+/* Rotation — applied to the first child of prev-content */
+.prev-content > * { transform-origin: center center; transition: transform .2s ease; }
+/* Rotation controls in the preview header */
+.prev-rot-btns { display: inline-flex; gap: 3px; margin-right: 4px; }
+.prev-rot-btns .btn { font-size: 16px; line-height: 1; }
+
+.prev-img {
+  max-width: 100%; max-height: 100%; object-fit: contain; border-radius: var(--r);
+  box-shadow: 0 4px 20px rgba(0,0,0,.5);
+}
+.prev-iframe { width: 100%; height: 100%; border: none; border-radius: var(--r); background: #fff; }
+.prev-pdf   { display: block; width: 100%; height: 100%; border: none; }
+.prev-video  { max-width: 100%; max-height: 100%; border-radius: var(--r); }
+.prev-audio-wrap { text-align: center; }
+.prev-audio-ico  { font-size: 56px; margin-bottom: 12px; display: block; opacity: .7; }
+.prev-audio-name { font-size: 13px; color: var(--txt-2); margin-bottom: 14px; }
+.prev-text {
+  width: 100%; height: 100%; align-self: flex-start;
+  font-family: 'SF Mono','Menlo',monospace; font-size: 11.5px;
+  color: var(--txt-2); line-height: 1.65; white-space: pre-wrap;
+  word-break: break-word; overflow: auto;
+}
+.prev-none { text-align: center; color: var(--txt-4); }
+.prev-none-ico { font-size: 48px; margin-bottom: 12px; display: block; opacity: .4; }
+.prev-none p  { font-size: 13px; line-height: 1.6; }
+
+/* DOCX preview */
+.prev-docx {
+  /* "Paper page" — renders like a real document, similar to PDF view */
+  width: calc(100% - 32px); max-width: 860px;
+  margin: 16px auto; padding: 36px 44px;
+  font-family: Georgia, 'Times New Roman', serif; font-size: 14.5px;
+  line-height: 1.7; color: #1d2433; align-self: flex-start;
+  background: #fdfdfb; border-radius: 4px;
+  box-shadow: 0 6px 28px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
+}
+.prev-docx h1,.prev-docx h2,.prev-docx h3,.prev-docx h4 {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+  color: #10254d; margin: 1.2em 0 .4em; line-height: 1.3;
+}
+.prev-docx h1 { font-size: 1.5em; }
+.prev-docx h2 { font-size: 1.25em; }
+.prev-docx h3 { font-size: 1.1em; }
+.prev-docx p  { margin: 0 0 .65em; }
+.prev-docx p:empty { min-height: .65em; }
+
+/* XLSX preview
+   max-height pins the wrap to the visible pane so the HORIZONTAL
+   scrollbar is always on-screen (it used to grow past the pane and
+   the bottom scrollbar was unreachable until you scrolled all rows). */
+.prev-xlsx-wrap {
+  width: 100%; height: 100%; max-height: 100%;
+  min-width: 0; min-height: 0;
+  overflow: auto; align-self: stretch;
+}
+/* XLSX-specific scrollbar — wide and easy to grab (the "outer" bar) */
+.prev-xlsx-wrap::-webkit-scrollbar { width: 18px; height: 18px; }
+.prev-xlsx-wrap::-webkit-scrollbar-track { background: var(--bg-3); border-radius: 8px; }
+.prev-xlsx-wrap::-webkit-scrollbar-thumb { background: var(--bdr-2); border-radius: 8px; border: 3px solid var(--bg-3); }
+.prev-xlsx-wrap::-webkit-scrollbar-thumb:hover { background: var(--gold); }
+.prev-xlsx-wrap::-webkit-scrollbar-corner { background: var(--bg-3); }
+.prev-xlsx {
+  border-collapse: collapse; font-size: 12px;
+  font-family: 'SF Mono','Menlo',monospace; width: max-content; min-width: 100%;
+}
+.prev-xlsx th {
+  background: var(--bg-3); color: var(--gold-l); font-weight: 600;
+  padding: 6px 10px; border: 1px solid var(--bdr); position: sticky; top: 0; z-index: 2;
+  white-space: nowrap;
+}
+.prev-xlsx td {
+  padding: 4px 10px; border: 1px solid var(--bdr); color: var(--txt-1);
+  max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.prev-xlsx tr:nth-child(even) td { background: rgba(255,255,255,.025); }
+.prev-xlsx .num { text-align: right; color: var(--blue); }
+.prev-xlsx .row-num { color: var(--txt-4); font-size: 11px; background: var(--bg-2) !important; }
+
+.f-name-link { cursor: pointer; }
+.f-name-link:hover { color: var(--gold-l); text-decoration: underline; text-decoration-color: var(--gold-b); }
+
+/* ================================================================
+   RESIZABLE + REORDERABLE COLUMNS
+================================================================ */
+.file-table { table-layout: fixed; }
+.file-table th { position: relative; overflow: hidden; cursor: default; }
+.file-table td { overflow: hidden; }
+/* The previewing accent bar is an inset shadow on the first cell —
+   it must not be clipped by the cell's own overflow:hidden. */
+.file-table tbody tr.previewing td:first-child { overflow: visible; }
+/* Col resize handle — always shows a visible separator */
+.col-rh {
+  position: absolute; right: 0; top: 10%; bottom: 10%; width: 5px;
+  cursor: col-resize; z-index: 2; flex-shrink: 0;
+  background: var(--bdr-2);
+  border-radius: 3px;
+  opacity: .75;
+  transition: opacity var(--t), background var(--t);
+}
+.col-rh:hover, .col-rh.active { background: var(--gold); opacity: 1; width: 5px; }
+body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none !important; }
+/* Drag-to-reorder */
+.th-dragging { opacity: .45; }
+.th-drop-target { background: var(--gold-d) !important; box-shadow: inset 2px 0 0 var(--gold); }
+/* Back navigation button */
+.btn-back {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 10px; border-radius: var(--r);
+  font-size: 12px; font-weight: 600; border: 1px solid var(--bdr);
+  background: var(--bg-3); color: var(--txt-2); cursor: pointer; font-family: inherit;
+  transition: all var(--t); white-space: nowrap;
+}
+.btn-back:hover { background: var(--bg-4); color: var(--txt-1); border-color: var(--bdr-2); }
+
+/* ================================================================
+   HASH COLUMN
+================================================================ */
+.th-hash { white-space: nowrap; }
+.th-hash-inner { display: flex; align-items: center; gap: 7px; }
+.algo-btn {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: var(--gold-d); border: 1px solid var(--gold-b);
+  border-radius: 4px; padding: 2px 7px;
+  font-size: 10px; font-weight: 700; color: var(--gold-l);
+  cursor: pointer; font-family: inherit; letter-spacing: .3px;
+  transition: all var(--t); white-space: nowrap;
+}
+.algo-btn:hover { background: rgba(45,212,191,.22); }
+
+.algo-drop {
+  position: fixed; background: var(--bg-3);
+  border: 1px solid var(--bdr-2); border-radius: var(--r);
+  box-shadow: 0 8px 28px rgba(0,0,0,.5); z-index: 400; overflow: hidden;
+  min-width: 110px;
+}
+.algo-drop button {
+  display: block; width: 100%; padding: 8px 14px;
+  text-align: left; background: none; border: none;
+  border-bottom: 1px solid var(--bdr);
+  cursor: pointer; font-size: 12.5px; color: var(--txt-2); font-family: inherit;
+  transition: background var(--t);
+}
+.algo-drop button:last-child { border-bottom: none; }
+.algo-drop button:hover { background: var(--bg-4); color: var(--txt-1); }
+.algo-drop button.cur { color: var(--gold-l); font-weight: 700; }
+
+.hash-cell { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.hash-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; flex-shrink: 0;
+  background: var(--bg-3); border: 1px solid var(--bdr);
+  border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--txt-4);
+  transition: all var(--t); font-family: inherit; line-height: 1;
+}
+.hash-btn:hover { background: var(--gold-d); border-color: var(--gold-b); color: var(--gold-l); }
+.hash-val {
+  font-family: 'SF Mono','Menlo',monospace; font-size: 10.5px;
+  color: var(--txt-3); cursor: pointer; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  /* No max-width — column width controls how much of the hash is visible */
+  min-width: 0; flex: 1;
+}
+.hash-val:hover { color: var(--gold-l); }
+.hash-spin {
+  color: var(--gold); font-size: 12px;
+  display: inline-block; animation: hspin .8s linear infinite;
+}
+@keyframes hspin { to { transform: rotate(360deg); } }
+
+/* ================================================================
+   HASH DUPLICATE GROUP COLORS
+   The hash-cell div gets a colored background; the whole row gets
+   a subtle tint via the CSS :has() selector (Chrome 105+ / Edge 105+).
+================================================================ */
+.hash-group-0 { background: rgba(34,211,238,.34); border-radius: 4px; padding: 1px 4px; }
+.hash-group-1 { background: rgba(163,230,53,.30); border-radius: 4px; padding: 1px 4px; }
+/* Row tinting — entire duplicate row gets a gentle wash */
+.file-table tbody tr:has(.hash-group-0) { background: rgba(34,211,238,.08) !important; }
+.file-table tbody tr:has(.hash-group-1) { background: rgba(163,230,53,.07)  !important; }
+
+/* ================================================================
+   DOCX TABLE (rendered document view)
+================================================================ */
+.prev-docx-tbl { border-collapse: collapse; width: 100%; margin: .6em 0; }
+.prev-docx-tbl td, .prev-docx-tbl th {
+  border: 1px solid #c9cdd6; padding: 5px 9px;
+  vertical-align: top; font-size: 13px; line-height: 1.5;
+}
+.prev-docx-tbl tr:nth-child(even) td { background: rgba(0,0,0,.035); }
+.prev-docx ul { padding-left: 20px; margin: .3em 0; list-style: disc; }
+.prev-docx ol { padding-left: 20px; margin: .3em 0; list-style: decimal; }
+.prev-docx li { margin-bottom: .25em; }
+
+/* ================================================================
+   PREVIEW PANEL DRAG-TO-RESIZE — outer bar (sibling to panel)
+================================================================ */
+.panel-dragger {
+  width: 10px; flex-shrink: 0;
+  cursor: ew-resize; z-index: 200;
+  background: var(--bg-3);
+  /* center grip stripe so the handle is easy to see and grab */
+  background-image: linear-gradient(var(--bdr-2), var(--bdr-2));
+  background-size: 3px 64px;
+  background-position: center;
+  background-repeat: no-repeat;
+  border-left: 1px solid var(--bdr);
+  border-right: 1px solid var(--bdr);
+  opacity: 0;                              /* hidden when panel closed */
+  transition: opacity var(--t), background-color var(--t);
+  display: none;                           /* flex item; shown via JS */
+}
+.panel-dragger.visible { display: block; opacity: .9; }
+.panel-dragger:hover,
+.panel-dragger.active {
+  background-color: var(--gold-d);
+  background-image: linear-gradient(var(--gold), var(--gold));
+  opacity: 1;
+}
+/* Transparent full-window shield shown only while dragging — stops the
+   PDF <embed> plugin from swallowing the mousemove/mouseup events. */
+#dragShield {
+  position: fixed; inset: 0; z-index: 199; cursor: ew-resize; display: none;
+}
+body.panel-resizing #dragShield { display: block; }
+body.panel-resizing,
+body.panel-resizing * { cursor: ew-resize !important; user-select: none !important; }
+
+/* ================================================================
+   RIGHT-CLICK CONTEXT MENU
+================================================================ */
+.ctx-menu {
+  position: fixed; z-index: 9999;
+  background: var(--bg-3); border: 1px solid var(--bdr-2);
+  border-radius: var(--r-md); padding: 5px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.55);
+  min-width: 150px; display: none;
+}
+.ctx-menu button {
+  display: block; width: 100%; padding: 8px 13px; text-align: left;
+  background: none; border: none; border-radius: var(--r);
+  color: var(--txt-1); font-size: 13px; cursor: pointer;
+  font-family: inherit; transition: background var(--t), color var(--t);
+}
+.ctx-menu button:hover { background: var(--bg-4); color: var(--gold-l); }
+.ctx-menu hr { border: none; border-top: 1px solid var(--bdr); margin: 4px 0; }
+
+/* Inline rename input (replaces the name span while renaming) */
+.inline-rename-input {
+  flex: 1; background: var(--bg-4); border: 1px solid var(--gold);
+  border-radius: 4px; padding: 2px 6px; font-size: 13px;
+  color: var(--txt-1); font-family: inherit; outline: none;
+  min-width: 0; max-width: 340px;
+}
+
+/* ================================================================
+   MULTI-LEVEL SORT — priority badge shown in column headers
+================================================================ */
+.sort-level-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--gold); color: var(--bg-0);
+  font-size: 8px; font-weight: 800; margin-left: 1px;
+  vertical-align: middle; line-height: 1; flex-shrink: 0;
+}
+
+/* ================================================================
+   SIDEBAR SUB-FILTERING — per-extension child rows
+================================================================ */
+.sidebar-expand-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--txt-4); font-size: 10px; padding: 0 3px;
+  line-height: 1; border-radius: 3px; transition: color var(--t);
+  flex-shrink: 0;
+}
+.sidebar-expand-btn:hover { color: var(--gold-l); }
+.sidebar-child {
+  padding: 4px 10px 4px 30px;
+  display: flex; align-items: center; gap: 7px;
+  cursor: pointer; border-radius: var(--r);
+  transition: background var(--t), color var(--t);
+  color: var(--txt-3); font-size: 12px;
+}
+.sidebar-child:hover { background: var(--bg-3); color: var(--txt-1); }
+.sidebar-child.active { background: var(--gold-d); color: var(--gold-l); }
+.sidebar-child .type-chip { margin-left: auto; }
+
+</style>
+</head>
+<body>
+
+<div id="loadBar"></div>
+
+<!-- RIGHT-CLICK CONTEXT MENU -->
+<div class="ctx-menu" id="ctxMenu">
+  <button id="ctxRename">✏️ Rename</button>
+  <button id="ctxPreview">👁 Preview</button>
+  <hr>
+  <button id="ctxCopy">📋 Copy To…</button>
+  <button id="ctxDelete">🗑 Delete</button>
+</div>
+
+<!-- ============================================================
+     HEADER
+============================================================ -->
+<header>
+  <div class="brand">
+    <div class="brand-icon">🗄</div>
+    <div class="brand-name">FileVault <em>Local Manager</em></div>
+  </div>
+
+  <button class="btn-back" id="btnBack" style="display:none" onclick="navigateBack()" title="Go back to parent folder">← Back</button>
+  <div class="path-pill" id="pathPill">No directory selected</div>
+  <div class="sel-path-pill" id="selPathPill" title="Full path of selected file"></div>
+  <input class="root-path-input" id="rootPathInput" type="text"
+         title="Absolute filesystem path to the open directory — required for Trash"
+         placeholder="/Volumes/…  (set for Trash to work)"
+         oninput="S.rootAbsPath = this.value.trim(); saveRootPath()">
+
+  <div class="hdr-btns">
+    <button class="btn btn-sec" onclick="refreshDirectory()" id="btnRefresh" disabled>↺ Refresh</button>
+    <button class="btn btn-primary" onclick="openDirectory()">📂 Open Directory</button>
+    <button class="btn btn-ghost btn-sq" onclick="showHelp()" title="Help (?)">❓</button>
+  </div>
+</header>
+
+<!-- ============================================================
+     WORKSPACE
+============================================================ -->
+<div class="workspace">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-hdr">File Types</div>
+    <div class="sidebar-scroll" id="sidebarList">
+      <div class="type-row active" id="type-all" onclick="filterType('all')">
+        <div class="type-dot" style="background:var(--txt-4)"></div>
+        <span class="type-label">📋 All Files</span>
+        <span class="type-chip" id="cnt-all">0</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- FILE AREA -->
+  <div class="file-area">
+
+    <!-- TOOLBAR -->
+    <div class="toolbar">
+      <div class="search-wrap">
+        <span class="search-ico">🔍</span>
+        <input class="search-input" id="searchInput" type="text"
+               placeholder="Search files…" oninput="handleSearch()"
+               onkeydown="if(event.key==='Escape'){clearSearch();}">
+        <button class="search-clear" id="searchClear" onclick="clearSearch()" title="Clear search (Esc)" style="display:none">✕</button>
+      </div>
+      <div class="toolbar-right">
+        <button class="btn btn-sec btn-sq view-btn active" id="vList" onclick="setView('list')" title="List view">☰</button>
+        <button class="btn btn-sec btn-sq view-btn" id="vGrid" onclick="setView('grid')" title="Grid view">⊞</button>
+        <button class="btn btn-sec" onclick="selectAll()" id="btnSelAll" disabled>Select All</button>
+      </div>
+    </div>
+
+    <!-- STATS -->
+    <div class="stats-bar" id="statsBar">
+      <span class="s">📄 <span id="stFiles">0</span> files</span>
+      <span class="s">📁 <span id="stDirs">0</span> folders</span>
+      <span class="s">💾 <span id="stSize">0 B</span></span>
+      <span class="stats-filtered" id="stFiltered"></span>
+    </div>
+
+    <!-- FILE TABLE / GRID / EMPTY STATE -->
+    <div class="file-table-wrap" id="fileTableWrap">
+
+      <!-- Empty state -->
+      <div class="empty-wrap" id="emptyState">
+        <div class="empty-ico">📂</div>
+        <div class="empty-title">No Directory Selected</div>
+        <div class="empty-desc">Click <strong>Open Directory</strong> to browse a folder or drive. Files are organized by type and you can copy, move, rename, or delete them locally.</div>
+        <button class="btn btn-primary" onclick="openDirectory()">📂 Open Directory</button>
+        <div id="apiWarn" style="display:none;color:var(--red);font-size:12px;margin-top:8px;max-width:340px;line-height:1.6"></div>
+      </div>
+
+      <!-- No results state -->
+      <div class="empty-wrap" id="noResults" style="display:none">
+        <div class="empty-ico" style="font-size:40px">🔍</div>
+        <div class="empty-title" style="font-size:16px">No matches</div>
+        <div class="empty-desc">Try a different search term or file type filter.</div>
+      </div>
+
+      <!-- Table (list view) -->
+      <table class="file-table" id="fileTable" style="display:none">
+        <colgroup id="fileColGroup"></colgroup>
+        <thead><tr id="fileHead"></tr></thead>
+        <tbody id="fileBody"></tbody>
+      </table>
+
+      <!-- Grid view -->
+      <div class="file-grid" id="fileGrid" style="display:none"></div>
+
+    </div><!-- /file-table-wrap -->
+
+    <!-- ACTION BAR -->
+    <div class="action-bar" id="actionBar">
+      <span class="sel-count" id="selCount">No selection</span>
+      <div class="act-div"></div>
+      <button class="btn btn-ok"     onclick="copyFiles()"        id="btnCopy"    disabled>📋 Copy To…</button>
+      <button class="btn btn-sec"    onclick="moveFiles()"        id="btnMove"    disabled>✂️ Move To…</button>
+      <button class="btn btn-sec"    onclick="renameFile()"       id="btnRename"  disabled>✏️ Rename</button>
+      <button class="btn btn-sec"    onclick="previewSelected()"  id="btnPreview" disabled>👁 Preview</button>
+      <button class="btn btn-sec"    onclick="hashSelected()"     id="btnHashSel" disabled>⊕ Hash Selected</button>
+      <button class="btn btn-danger" onclick="deleteFiles()"      id="btnDelete"  disabled>🗑 Delete</button>
+      <div class="act-spacer"></div>
+      <button class="btn btn-ghost"  onclick="clearSel()"         id="btnClear"   disabled>✕ Clear</button>
+    </div>
+
+  </div><!-- /file-area -->
+
+  <!-- PANEL RESIZE DRAGGER (sits between file-area and preview-panel) -->
+  <div class="panel-dragger" id="prevResizeHandle" title="Drag to resize preview panel"></div>
+
+  <!-- PREVIEW PANEL -->
+  <div class="preview-panel" id="previewPanel">
+    <div class="prev-hdr">
+      <span class="prev-title" id="prevTitle"
+            title="Click to rename this file"
+            onclick="renameFromPreview()"
+            oncontextmenu="event.preventDefault(); renameFromPreview();">Preview</span>
+      <button class="btn btn-sec" id="prevRenameBtn" onclick="renameFromPreview()" title="Rename this file" style="display:none">✎ Rename</button>
+      <span class="prev-rot-btns" id="prevRotBtns" style="display:none">
+        <button class="btn btn-ghost btn-sq" onclick="rotatePrev(-90)" title="Rotate left 90°">↺</button>
+        <button class="btn btn-ghost btn-sq" onclick="rotatePrev(90)"  title="Rotate right 90°">↻</button>
+      </span>
+      <button class="btn btn-ghost btn-sq" onclick="closePreview()" title="Close (Esc)">✕</button>
+    </div>
+    <div class="prev-meta" id="prevMeta"></div>
+    <div class="prev-content" id="prevContent">
+      <div class="prev-none"><span class="prev-none-ico">👁</span><p>Select a file to preview</p></div>
+    </div>
+  </div>
+
+</div><!-- /workspace -->
+<div id="dragShield"></div>
+
+<!-- ============================================================
+     MODALS
+============================================================ -->
+
+<!-- Confirm Delete -->
+<div class="overlay" id="modalDelete">
+  <div class="modal">
+    <div class="modal-title">🗑 Move to Trash</div>
+    <div class="modal-desc" id="delDesc">Items will be moved to macOS Trash.</div>
+    <div class="modal-actions">
+      <button class="btn btn-sec" onclick="closeModal('modalDelete')">Cancel</button>
+      <button class="btn btn-danger" onclick="confirmDelete()">Move to Trash</button>
+    </div>
+  </div>
+</div>
+
+<!-- Progress -->
+<div class="overlay" id="modalProg">
+  <div class="modal">
+    <div class="modal-title" id="progTitle">Working…</div>
+    <div class="modal-desc" id="progDesc">Please wait.</div>
+    <div class="prog-track"><div class="prog-fill" id="progFill"></div></div>
+  </div>
+</div>
+
+<!-- Open Directory Options -->
+<div class="overlay" id="modalOpenDir" onclick="if(event.target===this)closeModal('modalOpenDir')">
+  <div class="modal">
+    <div class="modal-title">📂 Open Directory</div>
+    <div class="modal-desc">Choose a folder or drive to browse. FileVault will scan its contents including subdirectories.</div>
+    <div class="depth-row">
+      <label for="depthInp">Scan depth (subdirectory levels):</label>
+      <input class="depth-inp" id="depthInp" type="number" value="3" min="0" max="10">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-sec" onclick="closeModal('modalOpenDir')">Cancel</button>
+      <button class="btn btn-primary" onclick="doOpenDirectory()">Choose Folder…</button>
+    </div>
+  </div>
+</div>
+
+<!-- Rename (custom — pre-selects just the base name, unlike native prompt) -->
+<div class="overlay" id="modalRename" onclick="if(event.target===this)closeModal('modalRename')">
+  <div class="modal">
+    <div class="modal-title">✎ Rename File</div>
+    <div class="modal-desc" id="renameDesc">Enter a new name. The extension is kept; just edit the name.</div>
+    <input class="depth-inp" id="renameInput" type="text" style="width:100%;font-size:13px;padding:8px 10px"
+           onkeydown="if(event.key==='Enter'){event.preventDefault();commitRenameModal();}if(event.key==='Escape'){closeModal('modalRename');}">
+    <div class="modal-actions">
+      <button class="btn btn-sec" onclick="closeModal('modalRename')">Cancel</button>
+      <button class="btn btn-primary" onclick="commitRenameModal()">Rename</button>
+    </div>
+  </div>
+</div>
+
+<!-- Help -->
+<div class="overlay" id="modalHelp" onclick="if(event.target===this)closeModal('modalHelp')">
+  <div class="modal modal-help">
+    <div class="modal-title">📖 FileVault Help</div>
+
+    <div class="help-sec">
+      <h3>Getting Started</h3>
+      <ul>
+        <li>Click <strong>Open Directory</strong> (top-right) to select any folder or drive.</li>
+        <li>Your browser will ask for permission — click <em>Allow</em> or <em>View Files</em>.</li>
+        <li>FileVault scans the directory and lists all files organized by type.</li>
+        <li>Set <strong>Scan depth</strong> before opening — higher values scan more subdirectories (may be slow for large drives).</li>
+      </ul>
+    </div>
+
+    <div class="help-sec">
+      <h3>Browsing &amp; Filtering</h3>
+      <ul>
+        <li>Use the <strong>sidebar</strong> on the left to filter files by type (Images, Video, Code…).</li>
+        <li>Use the <strong>search bar</strong> to find files by name.</li>
+        <li>Click column headers to <strong>sort</strong> by name, type, size, or date.</li>
+        <li>Toggle <strong>List / Grid</strong> view with the toolbar buttons.</li>
+      </ul>
+    </div>
+
+    <div class="help-sec">
+      <h3>Selecting Files</h3>
+      <ul>
+        <li>Click a row's checkbox to select individual files.</li>
+        <li>Use the header checkbox or <strong>Select All</strong> to select all visible files.</li>
+        <li>The <strong>Action Bar</strong> appears at the bottom when files are selected.</li>
+        <li><kbd>⌘A</kbd> — select all &nbsp; <kbd>Esc</kbd> — clear selection / close modal</li>
+      </ul>
+    </div>
+
+    <div class="help-sec">
+      <h3>File Operations</h3>
+      <ul>
+        <li><strong>Copy To…</strong> — Copy selected files to a folder you choose.</li>
+        <li><strong>Move To…</strong> — Move selected files (copy then delete originals).</li>
+        <li><strong>Rename</strong> — Rename a single selected file (one at a time).</li>
+        <li><strong>Open</strong> — Open file(s) in a new browser tab (great for images, PDFs, text).</li>
+        <li><strong>Delete</strong> — Moves selected files to macOS Trash via <code>server.py</code>. Requires the root path field in the header to be set correctly.</li>
+      </ul>
+    </div>
+
+    <div class="help-sec">
+      <h3>Browser Requirements</h3>
+      <ul>
+        <li>Requires the <strong>File System Access API</strong>.</li>
+        <li>Fully supported in <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong>, and <strong>Brave</strong>.</li>
+        <li>Safari on macOS Tahoe has partial support — Chrome is recommended.</li>
+        <li>Firefox does not currently support this API.</li>
+      </ul>
+    </div>
+
+    <div class="help-sec">
+      <h3>Privacy</h3>
+      <p>FileVault is 100% local. No data, files, or metadata leave your machine. Everything runs in your browser with no network calls.</p>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-primary" onclick="closeModal('modalHelp')">Got it</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toasts"></div>
+
+<!-- ============================================================
+     JAVASCRIPT
+============================================================ -->
+<script>
+'use strict';
+
+// ================================================================
+// STATE
+// ================================================================
+const S = {
+  rootHandle: null,
+  allFiles:   [],
+  filtered:   [],
+  selected:   new Set(),
+  activeType: 'all',
+  query:      '',
+  sortLevels: [{ field: 'name', dir: 'asc' }], // multi-level sort (up to 4)
+  activeExt:  null,              // extension sub-filter, e.g. 'pdf' or null
+  expandedSideTypes: new Set(), // sidebar type groups that are expanded
+  previewPath: null,            // path of file currently shown in preview pane
+  view:       'list',
+  depth:      3,
+  hashAlgo:   'SHA-256',
+  hashes:     new Map(),
+  _hcIds:     new Map(),
+  colOrder:   ['check','name','hash','folder','type','ext','size','date'],
+  colWidths:  {},
+  navStack:      [],
+  hashColorGroups: new Map(),
+  rootAbsPath:   '',
+  absPathStack:  []
+};
+
+// ================================================================
+// FILE TYPE REGISTRY
+// ================================================================
+const TYPES = {
+  Images:    { exts: ['jpg','jpeg','png','gif','webp','svg','ico','bmp','tiff','tif','heic','heif','avif','raw','cr2','nef','arw','psd','xcf'], icon:'🖼', color:'#58a6ff' },
+  Video:     { exts: ['mp4','mov','avi','mkv','webm','m4v','flv','wmv','3gp','mpeg','mpg','m2ts','ts','vob','mxf'], icon:'🎬', color:'#f78166' },
+  Audio:     { exts: ['mp3','wav','flac','aac','ogg','m4a','wma','aiff','aif','opus','alac','mid','midi'], icon:'🎵', color:'#d29922' },
+  Documents: { exts: ['pdf','doc','docx','xls','xlsx','ppt','pptx','odt','ods','odp','pages','numbers','key','txt','rtf','md','markdown','epub','mobi'], icon:'📄', color:'#3fb950' },
+  Code:      { exts: ['js','ts','jsx','tsx','py','java','c','cpp','h','hpp','cs','go','rs','rb','php','swift','kt','html','css','scss','less','json','xml','yaml','yml','toml','sh','bash','zsh','sql','r','m','vue','svelte','lua','pl','ex','dart'], icon:'💻', color:'#79c0ff' },
+  Archives:  { exts: ['zip','tar','gz','bz2','7z','rar','xz','tgz','dmg','iso','pkg','deb','rpm'], icon:'🗜', color:'#9e8a6e' },
+  Fonts:     { exts: ['ttf','otf','woff','woff2','eot'], icon:'🔤', color:'#d2a8ff' },
+  Data:      { exts: ['csv','tsv','db','sqlite','sqlite3','parquet','feather','arrow'], icon:'📊', color:'#ffa657' },
+  Others:    { exts: [], icon:'📎', color:'#6e7681' }
+};
+
+function typeOf(ext) {
+  if (!ext) return 'Others';
+  const e = ext.toLowerCase();
+  for (const [k, v] of Object.entries(TYPES)) {
+    if (k === 'Others') continue;
+    if (v.exts.includes(e)) return k;
+  }
+  return 'Others';
+}
+function iconOf(ext, isDir) {
+  if (isDir) return '📁';
+  return TYPES[typeOf(ext)]?.icon ?? '📎';
+}
+function colorOf(type) { return TYPES[type]?.color ?? '#6e7681'; }
+
+// ================================================================
+// DIRECTORY OPEN
+// ================================================================
+function openDirectory() {
+  if (!('showDirectoryPicker' in window)) {
+    toast('Your browser does not support the File System Access API. Please use Chrome, Edge, or Brave.', 'error');
+    return;
+  }
+  openModal('modalOpenDir');
+}
+
+async function doOpenDirectory() {
+  S.depth = parseInt(document.getElementById('depthInp').value, 10) || 3;
+  closeModal('modalOpenDir');
+  try {
+    const h = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' });
+    S.rootHandle = h;
+    S.selected.clear();
+    S.navStack = [];
+    S.absPathStack = [];
+    initRootPath(h.name);
+    updateBackBtn();
+    await scanDirectory();
+  } catch (e) {
+    if (e.name !== 'AbortError') toast('Could not open directory: ' + e.message, 'error');
+  }
+}
+
+async function refreshDirectory() {
+  if (!S.rootHandle) return;
+  S.selected.clear();
+  await scanDirectory();
+}
+
+async function scanDirectory() {
+  // Preserve hashes from the previous scan so they survive a Refresh.
+  // We snapshot them now and restore matching entries after the new scan completes.
+  const savedHashes = new Map(S.hashes);
+  S.allFiles = [];
+  S._hcIds.clear();
+  setLoading(true);
+  document.getElementById('pathPill').textContent = '📂 ' + S.rootHandle.name;
+  updateBackBtn();
+  document.getElementById('btnRefresh').disabled = true;
+  document.getElementById('btnSelAll').disabled = true;
+
+  try {
+    await collectFiles(S.rootHandle, S.rootHandle.name, 0);
+  } catch (e) {
+    toast('Scan error: ' + e.message, 'error');
+  }
+
+  // Restore previously computed hashes for files whose path still exists.
+  // Orphaned entries (deleted / renamed files) are naturally excluded.
+  S.hashes.clear();
+  const livePaths = new Set(S.allFiles.map(f => f.path));
+  for (const [path, entry] of savedHashes) {
+    if (livePaths.has(path)) S.hashes.set(path, entry);
+  }
+
+  setLoading(false);
+  document.getElementById('btnRefresh').disabled = false;
+  document.getElementById('btnSelAll').disabled = false;
+
+  buildSidebar();
+  applyFilters();
+  updateStats();
+  toast(`Loaded ${S.allFiles.filter(f=>!f.isDir).length} files`, 'success');
+}
+
+async function collectFiles(dirHandle, pathStr, depth) {
+  for await (const [name, handle] of dirHandle.entries()) {
+    if (name.startsWith('.')) continue;
+    if (handle.kind === 'file') {
+      try {
+        const f = await handle.getFile();
+        const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+        S.allFiles.push({
+          name, handle, ext,
+          type: typeOf(ext),
+          size: f.size,
+          lastMod: f.lastModified,
+          path: pathStr + '/' + name,
+          folder: pathStr,
+          parentHandle: dirHandle,
+          isDir: false
+        });
+      } catch { /* skip locked files */ }
+    } else if (handle.kind === 'directory') {
+      S.allFiles.push({
+        name, handle, ext: '', type: 'Folder',
+        size: 0, lastMod: Date.now(),
+        path: pathStr + '/' + name,
+        folder: pathStr,
+        parentHandle: dirHandle, isDir: true
+      });
+      if (depth < S.depth) {
+        await collectFiles(handle, pathStr + '/' + name, depth + 1);
+      }
+    }
+  }
+}
+
+// ================================================================
+// SIDEBAR
+// ================================================================
+function buildSidebar() {
+  // Count files by type and by extension within each type
+  const counts    = { all: 0 };  // type → total count
+  const extCounts = {};           // type → { ext → count }
+  for (const f of S.allFiles) {
+    if (f.isDir) { counts['Folder'] = (counts['Folder'] || 0) + 1; continue; }
+    counts.all++;
+    counts[f.type] = (counts[f.type] || 0) + 1;
+    if (f.ext) {
+      if (!extCounts[f.type]) extCounts[f.type] = {};
+      extCounts[f.type][f.ext] = (extCounts[f.type][f.ext] || 0) + 1;
+    }
+  }
+
+  const sb = document.getElementById('sidebarList');
+  sb.innerHTML = '';
+
+  addSideItem(sb, 'all',      '📋', 'All Files',       '#8b949e', counts.all || 0, false);
+  addSideItem(sb, 'ByFolder', '📂', 'Files By Folder', '#2dd4bf', counts.all || 0, false);
+  if (counts['Folder']) addSideItem(sb, 'Folder', '📁', 'Folders', '#f0b429', counts['Folder'], false);
+
+  const div = document.createElement('div');
+  div.className = 'sidebar-div';
+  sb.appendChild(div);
+
+  const order = Object.keys(TYPES).filter(t => t !== 'Others');
+  order.push('Others');
+  for (const t of order) {
+    if (!counts[t]) continue;
+    const typeExts    = extCounts[t] || {};
+    const extKeys     = Object.keys(typeExts).sort();
+    const hasChildren = extKeys.length > 1;
+
+    addSideItem(sb, t, TYPES[t].icon, t, TYPES[t].color, counts[t], hasChildren);
+
+    // Render child extension rows when this type is expanded
+    if (hasChildren && S.expandedSideTypes.has(t)) {
+      // "All <type>" reset row — clears the extension sub-filter
+      addSideAllChild(sb, t, counts[t], TYPES[t].color);
+      for (const ext of extKeys) {
+        addSideChildItem(sb, t, ext, typeExts[ext], TYPES[t].color);
+      }
+    }
+  }
+}
+
+function addSideItem(parent, key, icon, label, color, count, hasChildren) {
+  const d = document.createElement('div');
+  const isActive = (S.activeType === key && !S.activeExt);
+  d.className = 'type-row' + (isActive ? ' active' : '');
+  d.id = 'type-' + key;
+  d.onclick = () => filterType(key);
+
+  const expandBtn = hasChildren
+    ? `<button class="sidebar-expand-btn" title="${S.expandedSideTypes.has(key) ? 'Collapse' : 'Show file types'}" onclick="event.stopPropagation();toggleSideExpand('${key}')">${S.expandedSideTypes.has(key) ? '▼' : '▶'}</button>`
+    : '';
+
+  d.innerHTML = `
+    <div class="type-dot" style="background:${color}"></div>
+    <span class="type-label">${icon} ${label}</span>
+    <span class="type-chip">${count}</span>
+    ${expandBtn}`;
+  parent.appendChild(d);
+}
+
+function addSideAllChild(parent, type, count, color) {
+  // Reset row shown at the top of an expanded type — "All <type>"
+  const isActive = (S.activeType === type && !S.activeExt);
+  const d = document.createElement('div');
+  d.className = 'sidebar-child' + (isActive ? ' active' : '');
+  d.onclick = () => filterByExt(type, null);
+  d.innerHTML = `
+    <span class="f-badge" style="background:${color}1a;color:${color};border:1px solid ${color}40;font-size:10px;padding:1px 5px;border-radius:3px">ALL</span>
+    <span style="flex:1">All ${escH(type)}</span>
+    <span class="type-chip">${count}</span>`;
+  parent.appendChild(d);
+}
+
+function addSideChildItem(parent, type, ext, count, color) {
+  const isActive = (S.activeType === type && S.activeExt === ext);
+  const d = document.createElement('div');
+  d.className = 'sidebar-child' + (isActive ? ' active' : '');
+  d.onclick = () => filterByExt(type, ext);
+  d.innerHTML = `
+    <span class="f-badge" style="background:${color}1a;color:${color};border:1px solid ${color}40;font-size:10px;padding:1px 5px;border-radius:3px">${ext.toUpperCase()}</span>
+    <span style="flex:1">.${ext}</span>
+    <span class="type-chip">${count}</span>`;
+  parent.appendChild(d);
+}
+
+function toggleSideExpand(type) {
+  if (S.expandedSideTypes.has(type)) S.expandedSideTypes.delete(type);
+  else S.expandedSideTypes.add(type);
+  buildSidebar();
+}
+
+function filterByExt(type, ext) {
+  S.activeType = type;
+  S.activeExt  = ext;
+  S.selected.clear();
+  applyFilters();
+  updateActionBar();
+  buildSidebar();
+}
+
+// ================================================================
+// FILTERING
+// ================================================================
+function filterType(type) {
+  // Special: 'ByFolder' shows all files, auto-sorted by folder name
+  if (type === 'ByFolder') {
+    S.sortLevels = [{ field: 'folder', dir: 'asc' }];
+    S.activeType = 'all';
+    S.activeExt  = null;
+    S.selected.clear();
+    applyFilters();
+    updateActionBar();
+    buildSidebar();
+    return;
+  }
+  S.activeType = type;
+  S.activeExt  = null;
+  S.selected.clear();
+  // Auto-expand this type's extension sub-rows so the user can immediately
+  // narrow to a single extension (e.g. just PDFs) without a second hunt.
+  // Collapse any other expanded types to keep the sidebar tidy.
+  S.expandedSideTypes.clear();
+  S.expandedSideTypes.add(type);
+  applyFilters();
+  updateActionBar();
+  buildSidebar();
+}
+
+function handleSearch() {
+  const input = document.getElementById('searchInput');
+  S.query = input.value.toLowerCase();
+  const clr = document.getElementById('searchClear');
+  if (clr) clr.style.display = input.value ? 'flex' : 'none';
+  applyFilters();
+}
+
+function clearSearch() {
+  const input = document.getElementById('searchInput');
+  input.value = '';
+  S.query = '';
+  const clr = document.getElementById('searchClear');
+  if (clr) clr.style.display = 'none';
+  applyFilters();
+  input.focus();
+}
+
+function applyFilters() {
+  let files = [...S.allFiles];
+
+  if (S.activeType !== 'all') {
+    if (S.activeType === 'Folder') files = files.filter(f => f.isDir);
+    else files = files.filter(f => !f.isDir && f.type === S.activeType);
+  }
+
+  // Extension sub-filter (set by sidebar child row clicks)
+  if (S.activeExt) {
+    files = files.filter(f => f.ext === S.activeExt);
+  }
+
+  if (S.query) files = files.filter(f => f.name.toLowerCase().includes(S.query));
+
+  // Position-freeze: after a rename we want the file to STAY where it was in the
+  // list (Bryan renames a long column of files top-to-bottom and doesn't want the
+  // list to re-alphabetize and fling the row away). When _preserveOrder is set,
+  // reorder `files` to match the previous visible order instead of sorting, with
+  // any renamed path swapped in at its old slot.
+  if (S._preserveOrder) {
+    const remap = S._preserveOrder.remap || {};          // oldPath -> newPath
+    const prevOrder = S._preserveOrder.order;            // array of paths, old display order
+    const rank = new Map();
+    prevOrder.forEach((p, i) => rank.set(remap[p] || p, i));
+    files.sort((a, b) => {
+      const ra = rank.has(a.path) ? rank.get(a.path) : Number.MAX_SAFE_INTEGER;
+      const rb = rank.has(b.path) ? rank.get(b.path) : Number.MAX_SAFE_INTEGER;
+      return ra - rb;
+    });
+    S._preserveOrder = null;                              // one-shot
+    S.filtered = files;
+    computeHashColorGroups();
+    render();
+    updateStatFiltered();
+    return;
+  }
+
+  // Multi-level sort: cascade through all sort levels in order
+  files.sort((a, b) => {
+    for (const level of S.sortLevels) {
+      let va, vb;
+      switch (level.field) {
+        case 'name':   va = a.name.toLowerCase(); vb = b.name.toLowerCase(); break;
+        case 'ext':    va = (a.ext||'').toLowerCase(); vb = (b.ext||'').toLowerCase(); break;
+        case 'type':   va = a.type; vb = b.type; break;
+        case 'size':   va = a.size; vb = b.size; break;
+        case 'date':   va = a.lastMod; vb = b.lastMod; break;
+        case 'folder': va = (a.folder||'').toLowerCase(); vb = (b.folder||'').toLowerCase(); break;
+        case 'hash': {
+          const ha = S.hashes.get(a.path);
+          const hb = S.hashes.get(b.path);
+          va = ha?.status === 'done' ? ha.value : '\uFFFF';
+          vb = hb?.status === 'done' ? hb.value : '\uFFFF';
+          break;
+        }
+        default: va = a.name; vb = b.name;
+      }
+      if (va < vb) return level.dir === 'asc' ? -1 : 1;
+      if (va > vb) return level.dir === 'asc' ?  1 : -1;
+      // Tied on this level — fall through to the next sort level
+    }
+    return 0;
+  });
+
+  S.filtered = files;
+  computeHashColorGroups();
+  render();
+  updateStatFiltered();
+}
+
+// Assign alternating color indices to groups of files sharing the same computed hash.
+// Scans ALL files so duplicates are caught even across type filters.
+function computeHashColorGroups() {
+  S.hashColorGroups.clear();
+  const byHash = new Map(); // hash_value → [paths]
+  for (const f of S.allFiles) {
+    if (f.isDir) continue;
+    const h = S.hashes.get(f.path);
+    if (h?.status === 'done') {
+      if (!byHash.has(h.value)) byHash.set(h.value, []);
+      byHash.get(h.value).push(f.path);
+    }
+  }
+  let idx = 0;
+  for (const [, paths] of byHash) {
+    if (paths.length >= 2) {
+      for (const p of paths) S.hashColorGroups.set(p, idx % 2);
+      idx++;
+    }
+  }
+}
+
+// Click = set as primary sort (toggle dir if already primary).
+// Shift+click = add as secondary/tertiary/quaternary level, or toggle
+// direction if the field is already in the sort stack (max 4 levels).
+function sortBy(field, addLevel = false) {
+  if (addLevel && S.sortLevels.length > 0) {
+    const idx = S.sortLevels.findIndex(l => l.field === field);
+    if (idx >= 0) {
+      // Already in the stack — toggle its direction
+      S.sortLevels[idx].dir = S.sortLevels[idx].dir === 'asc' ? 'desc' : 'asc';
+    } else if (S.sortLevels.length < 4) {
+      // Add as the next level (up to 4 total)
+      S.sortLevels.push({ field, dir: 'asc' });
+    }
+    // At 4 levels and not present → silently ignore (max reached)
+  } else {
+    // Normal click: primary sort only
+    if (S.sortLevels.length === 1 && S.sortLevels[0].field === field) {
+      S.sortLevels[0].dir = S.sortLevels[0].dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      S.sortLevels = [{ field, dir: 'asc' }];
+    }
+  }
+  applyFilters();
+}
+
+// ================================================================
+// RENDER
+// ================================================================
+function render() {
+  const empty = document.getElementById('emptyState');
+  const noRes = document.getElementById('noResults');
+  const tbl   = document.getElementById('fileTable');
+  const grd   = document.getElementById('fileGrid');
+
+  if (S.allFiles.length === 0) {
+    empty.style.display = 'flex'; noRes.style.display = 'none';
+    tbl.style.display = 'none'; grd.style.display = 'none'; return;
+  }
+  empty.style.display = 'none';
+
+  if (S.filtered.length === 0) {
+    noRes.style.display = 'flex'; tbl.style.display = 'none'; grd.style.display = 'none'; return;
+  }
+  noRes.style.display = 'none';
+
+  if (S.view === 'grid') renderGrid();
+  else renderTable();
+}
+
+// Column definitions (id → metadata)
+const COL_DEFS = {
+  check:  { label: '',         sortKey: null,     defWidth: '40px'  },
+  name:   { label: 'Name',     sortKey: 'name',   defWidth: null    },
+  folder: { label: 'Folder',   sortKey: 'folder', defWidth: '130px' },
+  hash:   { label: 'Hash',     sortKey: 'hash',   defWidth: '220px' },
+  type:   { label: 'Type',     sortKey: 'type',   defWidth: '88px'  },
+  ext:    { label: 'Ext',      sortKey: 'ext',    defWidth: '68px'  },
+  size:   { label: 'Size',     sortKey: 'size',   defWidth: '82px'  },
+  date:   { label: 'Modified', sortKey: 'date',   defWidth: '112px' },
+};
+
+function rebuildColGroup() {
+  const cg = document.getElementById('fileColGroup');
+  cg.innerHTML = '';
+  for (const cid of S.colOrder) {
+    const col = document.createElement('col');
+    col.id = 'colg-' + cid;
+    const w = S.colWidths[cid] || COL_DEFS[cid].defWidth;
+    if (w) col.style.width = w;
+    cg.appendChild(col);
+  }
+}
+
+function renderHead() {
+  const tr = document.getElementById('fileHead');
+  if (!tr) return;
+  tr.innerHTML = '';
+  let _dragSrc = null;
+
+  for (const cid of S.colOrder) {
+    const def = COL_DEFS[cid];
+    const th  = document.createElement('th');
+    th.dataset.cid = cid;
+
+    if (cid === 'check') {
+      th.style.width = '40px';
+      th.innerHTML = `<input type="checkbox" class="cb" id="cbAll" onchange="toggleSelectAll(this)">`;
+      tr.appendChild(th); continue;
+    }
+    if (cid === 'hash') {
+      const lvlIdx = S.sortLevels.findIndex(l => l.field === 'hash');
+      const active = lvlIdx >= 0;
+      const lvl    = active ? S.sortLevels[lvlIdx] : null;
+      const arrow  = active ? (lvl.dir === 'asc' ? '↑' : '↓') : '↕';
+      const cls    = active ? 'srt' : 'srt srt-off';
+      const badge  = (S.sortLevels.length > 1 && active) ? `<span class="sort-level-badge">${lvlIdx + 1}</span>` : '';
+      th.className = 'th-hash';
+      th.style.cursor = 'pointer';
+      th.title = 'Click to sort · Shift+click to add secondary sort level';
+      th.innerHTML = `<div class="th-hash-inner">Hash <span class="${cls}" id="srt-hash">${arrow}${badge}</span><button class="algo-btn" id="algoBtnHdr" onclick="toggleAlgoMenu(event)">${S.hashAlgo} ▾</button></div>`;
+      th.addEventListener('click', e => {
+        if (!e.target.closest('.col-rh') && !e.target.closest('.algo-btn')) sortBy('hash', e.shiftKey);
+      });
+    } else {
+      const lvlIdx = S.sortLevels.findIndex(l => l.field === def.sortKey);
+      const active = lvlIdx >= 0;
+      const lvl    = active ? S.sortLevels[lvlIdx] : null;
+      const arrow  = active ? (lvl.dir === 'asc' ? '↑' : '↓') : '↕';
+      const cls    = active ? 'srt' : 'srt srt-off';
+      const badge  = (S.sortLevels.length > 1 && active) ? `<span class="sort-level-badge">${lvlIdx + 1}</span>` : '';
+      th.innerHTML = `${def.label} <span class="${cls}" id="srt-${def.sortKey}">${arrow}${badge}</span>`;
+      th.title = def.sortKey ? 'Click to sort · Shift+click to add secondary sort level' : '';
+      th.addEventListener('click', e => { if (!e.target.closest('.col-rh')) sortBy(def.sortKey, e.shiftKey); });
+    }
+
+    // Drag-to-reorder
+    th.draggable = true;
+    th.addEventListener('dragstart', e => {
+      if (e.target.classList.contains('col-rh')) { e.preventDefault(); return; }
+      _dragSrc = cid; th.classList.add('th-dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', cid);
+    });
+    th.addEventListener('dragend', () => {
+      th.classList.remove('th-dragging');
+      document.querySelectorAll('.th-drop-target').forEach(t => t.classList.remove('th-drop-target'));
+    });
+    th.addEventListener('dragover', e => {
+      if (_dragSrc && _dragSrc !== cid) { e.preventDefault(); th.classList.add('th-drop-target'); }
+    });
+    th.addEventListener('dragleave', () => th.classList.remove('th-drop-target'));
+    th.addEventListener('drop', e => {
+      e.preventDefault(); th.classList.remove('th-drop-target');
+      const src = e.dataTransfer.getData('text/plain');
+      if (!src || src === cid || src === 'check') return;
+      const fi = S.colOrder.indexOf(src), ti = S.colOrder.indexOf(cid);
+      if (fi < 0 || ti < 0) return;
+      S.colOrder.splice(fi, 1); S.colOrder.splice(ti, 0, src);
+      rebuildColGroup(); renderHead(); renderTable();
+    });
+
+    // Resize handle
+    const rh = document.createElement('div');
+    rh.className = 'col-rh'; rh.draggable = false;
+    rh.addEventListener('mousedown', e => {
+      e.preventDefault(); e.stopPropagation();
+      const col = document.getElementById('colg-' + cid);
+      const startX = e.clientX, startW = th.offsetWidth;
+      rh.classList.add('active');
+      document.body.classList.add('col-resizing');
+      const onMove = e => {
+        const w = Math.max(52, startW + e.clientX - startX);
+        S.colWidths[cid] = w + 'px';
+        if (col) col.style.width = w + 'px';
+      };
+      const onUp = () => {
+        rh.classList.remove('active');
+        document.body.classList.remove('col-resizing');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+    th.appendChild(rh);
+    tr.appendChild(th);
+  }
+}
+
+function renderTable() {
+  document.getElementById('fileTable').style.display = 'table';
+  document.getElementById('fileGrid').style.display = 'none';
+
+  S._hcIds.clear();
+  let hcSeq = 0;
+  const frag = document.createDocumentFragment();
+
+  for (const f of S.filtered) {
+    const tr    = document.createElement('tr');
+    const sel   = S.selected.has(f.path);
+    const color = f.isDir ? '#f0b429' : colorOf(f.type);
+    const ext   = f.ext ? f.ext.toUpperCase() : (f.isDir ? 'DIR' : '—');
+    const hcId  = 'hc' + (hcSeq++);
+    if (!f.isDir) S._hcIds.set(f.path, hcId);
+    if (sel) tr.classList.add('sel');
+    if (S.previewPath && f.path === S.previewPath) tr.classList.add('previewing');
+    // Store path/isdir on the row — avoids inline JS escaping entirely
+    tr.dataset.path  = f.path;
+    tr.dataset.isdir = f.isDir ? '1' : '0';
+
+    let html = '';
+    for (const cid of S.colOrder) {
+      switch (cid) {
+        case 'check':
+          html += `<td><input type="checkbox" class="cb" ${sel?'checked':''}></td>`;
+          break;
+        case 'name': {
+          const tip = f.isDir ? 'Double-click to open folder' : 'Click to preview';
+          html += `<td><div class="f-name-cell">
+            <span class="f-icon">${iconOf(f.ext,f.isDir)}</span>
+            <span class="f-name f-name-link" title="${tip}">${escH(f.name)}</span>
+          </div></td>`; break;
+        }
+        case 'hash': {
+          const grpIdx   = S.hashColorGroups.get(f.path);
+          const grpClass = grpIdx !== undefined ? ` hash-group-${grpIdx}` : '';
+          html += `<td><div class="hash-cell${grpClass}" id="${hcId}" data-path="${escH(f.path)}">${f.isDir?'':hashCellHTML(f)}</div></td>`; break;
+        }
+        case 'folder': {
+          const fld = f.folder ? (f.folder.split('/').pop() || f.folder) : '—';
+          html += `<td class="f-type" title="${escH(f.folder||'')}">${escH(fld)}</td>`; break;
+        }
+        case 'type':
+          html += `<td class="f-type">${f.type}</td>`; break;
+        case 'ext': {
+          const extLabel = f.ext ? f.ext.toUpperCase() : (f.isDir ? 'DIR' : '—');
+          html += `<td class="f-type"><span class="f-badge" style="background:${color}1a;color:${color};border:1px solid ${color}40">${extLabel}</span></td>`; break;
+        }
+        case 'size':
+          html += `<td class="f-size">${f.isDir?'—':fmtSize(f.size)}</td>`; break;
+        case 'date':
+          html += `<td class="f-date">${fmtDate(f.lastMod)}</td>`; break;
+      }
+    }
+    tr.innerHTML = html;
+    frag.appendChild(tr);
+  }
+
+  const tbody = document.getElementById('fileBody');
+  tbody.innerHTML = ''; tbody.appendChild(frag);
+
+  const cbAll = document.getElementById('cbAll');
+  if (cbAll) cbAll.checked = S.filtered.length > 0 && S.filtered.every(f => S.selected.has(f.path));
+
+  renderHead();
+}
+
+function renderGrid() {
+  document.getElementById('fileTable').style.display = 'none';
+  const grd = document.getElementById('fileGrid');
+  grd.style.display = 'grid';
+  grd.innerHTML = '';
+
+  for (const f of S.filtered) {
+    const card = document.createElement('div');
+    card.className = 'grid-card' + (S.selected.has(f.path) ? ' sel' : '');
+    // Store path/isdir on the card element — delegated handler reads these
+    card.dataset.path  = f.path;
+    card.dataset.isdir = f.isDir ? '1' : '0';
+    card.title = f.isDir ? 'Double-click to open folder' : 'Double-click to preview';
+    card.innerHTML = `
+      <input type="checkbox" class="cb grid-cb" ${S.selected.has(f.path)?'checked':''}>
+      <div class="grid-ico">${iconOf(f.ext, f.isDir)}</div>
+      <div class="grid-name" title="${escH(f.path)}">${escH(f.name)}</div>
+      <div class="grid-ext">${f.ext ? f.ext.toUpperCase() : (f.isDir ? 'Folder' : '—')}</div>`;
+    grd.appendChild(card);
+  }
+}
+
+function setView(v) {
+  S.view = v;
+  document.getElementById('vList').classList.toggle('active', v === 'list');
+  document.getElementById('vGrid').classList.toggle('active', v === 'grid');
+  render();
+}
+
+// ================================================================
+// SELECTION
+// ================================================================
+function toggleSel(path) {
+  S.selected.has(path) ? S.selected.delete(path) : S.selected.add(path);
+  render();
+  updateActionBar();
+}
+
+function toggleSelectAll(cb) {
+  if (cb.checked) S.filtered.forEach(f => S.selected.add(f.path));
+  else            S.filtered.forEach(f => S.selected.delete(f.path));
+  render();
+  updateActionBar();
+}
+
+function selectAll() {
+  // If every visible file is already selected, deselect all; otherwise select all
+  const allSelected = S.filtered.length > 0 &&
+                      S.filtered.every(f => S.selected.has(f.path));
+  if (allSelected) {
+    S.selected.clear();
+  } else {
+    S.filtered.forEach(f => S.selected.add(f.path));
+  }
+  render();
+  updateActionBar();
+}
+
+function clearSel() {
+  S.selected.clear();
+  render();
+  updateActionBar();
+}
+
+function updateActionBar() {
+  const n = S.selected.size;
+  const previewOpen = !!S.previewPath &&
+    document.getElementById('previewPanel').classList.contains('open');
+  let countLabel = n > 0 ? n + ' selected' : (previewOpen ? 'Previewing 1' : 'No selection');
+  document.getElementById('selCount').textContent = countLabel;
+  const none = n === 0;
+  ['btnCopy','btnMove','btnHashSel','btnDelete','btnClear'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = none;
+  });
+  // Preview button: enabled if something is checked OR a file is already shown.
+  const btnPrev = document.getElementById('btnPreview');
+  if (btnPrev) btnPrev.disabled = none && !previewOpen;
+  // Rename works on a single selected file OR the file open in the preview pane.
+  document.getElementById('btnRename').disabled = !(n === 1 || previewOpen);
+
+  // Toggle "Select All" ↔ "Deselect All" label
+  const allSelected = S.filtered.length > 0 &&
+                      S.filtered.every(f => S.selected.has(f.path));
+  const btnSelAll = document.getElementById('btnSelAll');
+  if (btnSelAll) btnSelAll.textContent = allSelected ? 'Deselect All' : 'Select All';
+
+  // Show selected-file full path in header when exactly 1 file is selected
+  const pathPill = document.getElementById('selPathPill');
+  if (pathPill) {
+    if (n === 1) {
+      const f = getSelFiles()[0];
+      if (f) {
+        pathPill.textContent = f.path;
+        pathPill.title = f.path;
+        pathPill.style.display = 'block';
+      }
+    } else {
+      pathPill.style.display = 'none';
+    }
+  }
+}
+
+function getSelFiles() { return S.allFiles.filter(f => S.selected.has(f.path)); }
+
+// ================================================================
+// FILE OPERATIONS
+// ================================================================
+async function copyFiles() {
+  const files = getSelFiles().filter(f => !f.isDir);
+  if (!files.length) { toast('Select files to copy (folders not supported)', 'warn'); return; }
+  let dest;
+  try { dest = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' }); }
+  catch (e) { if (e.name !== 'AbortError') toast('Could not open destination', 'error'); return; }
+
+  showProg('Copying', `Copying ${files.length} file(s)…`);
+  let ok = 0, fail = 0;
+  for (let i = 0; i < files.length; i++) {
+    try {
+      const fo = await files[i].handle.getFile();
+      const dh = await dest.getFileHandle(files[i].name, { create: true });
+      const wr = await dh.createWritable();
+      await wr.write(fo); await wr.close();
+      ok++;
+    } catch (e) { fail++; console.error(e); }
+    setProg(Math.round((i + 1) / files.length * 100));
+  }
+  closeModal('modalProg');
+  fail === 0 ? toast(`Copied ${ok} file(s)`, 'success') : toast(`Copied ${ok}, failed ${fail}`, 'warn');
+}
+
+async function moveFiles() {
+  const files = getSelFiles().filter(f => !f.isDir);
+  if (!files.length) { toast('Select files to move (folders not supported)', 'warn'); return; }
+  let dest;
+  try { dest = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' }); }
+  catch (e) { if (e.name !== 'AbortError') toast('Could not open destination', 'error'); return; }
+
+  showProg('Moving', `Moving ${files.length} file(s)…`);
+  let ok = 0, fail = 0;
+  for (let i = 0; i < files.length; i++) {
+    try {
+      const fo = await files[i].handle.getFile();
+      const dh = await dest.getFileHandle(files[i].name, { create: true });
+      const wr = await dh.createWritable();
+      await wr.write(fo); await wr.close();
+      await files[i].parentHandle.removeEntry(files[i].name);
+      S.selected.delete(files[i].path);
+      ok++;
+    } catch (e) { fail++; console.error(e); }
+    setProg(Math.round((i + 1) / files.length * 100));
+  }
+  closeModal('modalProg');
+  fail === 0 ? toast(`Moved ${ok} file(s)`, 'success') : toast(`Moved ${ok}, failed ${fail}`, 'warn');
+  await refreshDirectory();
+}
+
+async function renameFile() {
+  // Rename should act on the file the user is actually looking at. If the preview
+  // pane is open, that file is the target (preview = what's on the right). This
+  // prevents the desync where the selection lagged behind a click and you'd rename
+  // the wrong file. Otherwise fall back to the single checkbox selection.
+  let f = null;
+  if (S.previewPath && document.getElementById('previewPanel').classList.contains('open')) {
+    f = S.allFiles.find(x => x.path === S.previewPath);
+  }
+  if (!f) {
+    const files = getSelFiles();
+    if (files.length !== 1) { toast('Select exactly one file to rename (or open one in preview).', 'warn'); return; }
+    f = files[0];
+  }
+  if (f.isDir) { toast('Folder rename not supported', 'warn'); return; }
+  // Try to find the row and do inline rename; fall back to the custom modal
+  const tr = document.querySelector(`tr[data-path="${CSS.escape(f.path)}"]`);
+  if (tr) { startInlineRename(f.path, tr); return; }
+  openRenameModal(f.path);
+}
+
+// Safe rename: validate name → write new file → VERIFY size → only then
+// delete the original. If anything fails, the original is left untouched and
+// any partial new file is cleaned up. (A bad/too-long name used to be able to
+// delete the original after a failed write — this prevents that.)
+async function _doRename(f, newName) {
+  // --- 1. Validate the new name BEFORE touching the filesystem ---
+  newName = (newName || '').trim();
+  if (!newName || newName === f.name) return;
+  // macOS/APFS: max 255 UTF-8 bytes per filename component; no '/' or ':' or NUL
+  const byteLen = new TextEncoder().encode(newName).length;
+  if (byteLen > 255) {
+    toast(`Name too long (${byteLen} bytes; max is 255). File NOT renamed.`, 'error');
+    return;
+  }
+  if (/[/:\x00]/.test(newName)) {
+    toast('Name can’t contain “/”, “:” or control characters. File NOT renamed.', 'error');
+    return;
+  }
+  // Refuse to overwrite an existing different file
+  try {
+    await f.parentHandle.getFileHandle(newName);          // resolves = it exists
+    toast(`A file named “${newName}” already exists here. File NOT renamed.`, 'error');
+    return;
+  } catch (_) { /* good — name is free */ }
+
+  let nh = null;
+  try {
+    const fo = await f.handle.getFile();
+    const origSize = fo.size;
+
+    // --- 2. Write the new file completely ---
+    nh = await f.parentHandle.getFileHandle(newName, { create: true });
+    const wr = await nh.createWritable();
+    await wr.write(fo);
+    await wr.close();
+
+    // --- 3. VERIFY the new file before deleting the original ---
+    const check = await nh.getFile();
+    if (check.size !== origSize) {
+      throw new Error(`size mismatch (wrote ${check.size} of ${origSize} bytes)`);
+    }
+
+    // --- 4. Safe to remove the original now ---
+    await f.parentHandle.removeEntry(f.name);
+
+    // Transfer any computed hash to the new path so it survives the rename.
+    const newPath = f.folder + '/' + newName;
+    if (S.hashes.has(f.path)) {
+      S.hashes.set(newPath, S.hashes.get(f.path));
+      S.hashes.delete(f.path);
+    }
+    toast(`Renamed to "${newName}"`, 'success');
+    clearSel();
+    // Freeze the list order across the upcoming refresh so the renamed file
+    // stays in its current slot instead of re-alphabetizing and scrolling away.
+    S._preserveOrder = {
+      order: S.filtered.map(x => x.path),
+      remap: { [f.path]: newPath }
+    };
+    // Remember exact scroll position so the viewport doesn't jump on refresh.
+    const wrapEl = document.getElementById('fileTableWrap');
+    const savedScroll = wrapEl ? wrapEl.scrollTop : 0;
+    await refreshDirectory();
+    // Keep focus on the renamed file: re-select + highlight it, but DON'T scroll
+    // (order is frozen, so its row is already where the user was looking).
+    keepFocusOnFile(newPath, { scroll: false });
+    // Restore the exact scroll position after the re-render settles.
+    if (wrapEl) {
+      const restore = () => { wrapEl.scrollTop = savedScroll; };
+      requestAnimationFrame(restore);
+      setTimeout(restore, 60);   // belt-and-suspenders against a late re-render
+    }
+    // If the preview pane is open, update its header title to the new name.
+    const titleEl = document.getElementById('prevTitle');
+    if (titleEl && document.getElementById('previewPanel').classList.contains('open')) {
+      titleEl.textContent = newName;
+      titleEl.dataset.path = newPath;
+    }
+  } catch (e) {
+    // Roll back any partial new file; the ORIGINAL is still intact.
+    if (nh) { try { await f.parentHandle.removeEntry(newName); } catch (_) {} }
+    toast('Rename failed (original is safe): ' + e.message, 'error');
+  }
+}
+
+function startInlineRename(path, tr) {
+  const f = S.allFiles.find(x => x.path === path);
+  if (!f || f.isDir) { toast('Folder rename not supported', 'warn'); return; }
+  const nameSpan = tr.querySelector('.f-name-link');
+  if (!nameSpan) return;
+
+  // Keep the preview pane in sync with the file being renamed, so you're never
+  // editing one file while the preview shows an unrelated document.
+  if (document.getElementById('previewPanel').classList.contains('open')
+      && S.previewPath !== path) {
+    previewFile(f);
+  }
+
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.value = f.name;
+  inp.className = 'inline-rename-input';
+  nameSpan.replaceWith(inp);
+  inp.focus();
+  // Select the name without the extension so user can type a new base name
+  const dot = f.name.lastIndexOf('.');
+  inp.setSelectionRange(0, dot > 0 ? dot : f.name.length);
+
+  let committed = false;
+  const commit = async () => {
+    if (committed) return;
+    committed = true;
+    const newName = inp.value.trim();
+    inp.replaceWith(nameSpan); // restore span before async work
+    if (!newName || newName === f.name) return;
+    await _doRename(f, newName);
+  };
+  const cancel = () => {
+    if (committed) return;
+    committed = true;
+    inp.replaceWith(nameSpan);
+  };
+
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  { e.preventDefault(); commit(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  inp.addEventListener('blur', commit, { once: true });
+}
+
+// ================================================================
+// PREVIEW PANEL
+// ================================================================
+const PREV_IMG   = ['jpg','jpeg','png','gif','webp','svg','ico','bmp','tiff','tif','heic','heif','avif'];
+const IMG_MIME   = {
+  jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif',
+  webp:'image/webp', svg:'image/svg+xml', ico:'image/x-icon', bmp:'image/bmp',
+  tiff:'image/tiff', tif:'image/tiff', heic:'image/heic', heif:'image/heif',
+  avif:'image/avif'
+};
+const PREV_VID   = ['mp4','mov','webm','m4v','ogv'];
+const PREV_AUD   = ['mp3','wav','flac','aac','ogg','m4a','opus','aiff','aif'];
+const PREV_TEXT  = ['txt','md','markdown','csv','tsv','log','json','xml','yaml','yml','toml',
+                    'js','ts','jsx','tsx','py','java','c','cpp','h','hpp','cs','go','rs','rb',
+                    'php','swift','kt','html','css','scss','less','sh','bash','zsh','sql','r',
+                    'vue','svelte','lua','pl','ini','cfg','conf','gitignore','env'];
+
+let _prevUrl      = null;
+let _prevRotation = 0;  // current preview rotation in degrees (0 / 90 / 180 / 270)
+
+function rotatePrev(delta) {
+  _prevRotation = ((_prevRotation + delta) % 360 + 360) % 360;
+  // Apply to the rendered content child (img, embed, div, pre, etc.)
+  const content = document.getElementById('prevContent');
+  const child   = content ? content.firstElementChild : null;
+  if (child) child.style.transform = _prevRotation ? `rotate(${_prevRotation}deg)` : '';
+}
+
+// ================================================================
+// ZIP READER  (used by DOCX / XLSX preview)
+// Locates an entry via the Central Directory, then decompresses it.
+// ================================================================
+async function readZipEntry(buf, targetName) {
+  const bytes = new Uint8Array(buf);
+  const view  = new DataView(buf);
+
+  // Find End of Central Directory signature 0x06054b50 (scanning from end)
+  let eocd = -1;
+  const end = bytes.length;
+  for (let i = end - 22; i >= Math.max(0, end - 22 - 65535); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+
+  const cdCount = view.getUint16(eocd + 8,  true);
+  const cdSize  = view.getUint32(eocd + 12, true);
+  const cdOff   = view.getUint32(eocd + 16, true);
+
+  let p = cdOff;
+  for (let i = 0; i < cdCount; i++) {
+    if (view.getUint32(p, true) !== 0x02014b50) break; // Central Dir signature
+    const method    = view.getUint16(p + 10, true);
+    const compSz    = view.getUint32(p + 20, true);
+    const uncompSz  = view.getUint32(p + 24, true);
+    const fnLen     = view.getUint16(p + 28, true);
+    const extraLen  = view.getUint16(p + 30, true);
+    const cmtLen    = view.getUint16(p + 32, true);
+    const localOff  = view.getUint32(p + 42, true);
+    const name      = new TextDecoder().decode(bytes.slice(p + 46, p + 46 + fnLen));
+    p += 46 + fnLen + extraLen + cmtLen;
+
+    if (name !== targetName) continue;
+
+    // Read Local File Header to find actual data start
+    const lhExtraLen = view.getUint16(localOff + 28, true);
+    const dataOff    = localOff + 30 + fnLen + lhExtraLen;
+    const compData   = bytes.slice(dataOff, dataOff + compSz);
+
+    if (method === 0) {
+      // Stored (no compression)
+      return compData.buffer;
+    }
+    if (method === 8) {
+      // Deflate — use DecompressionStream
+      const ds = new DecompressionStream('deflate-raw');
+      const writer = ds.writable.getWriter();
+      const reader = ds.readable.getReader();
+      writer.write(compData);
+      writer.close();
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.length;
+      }
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
+      return out.buffer;
+    }
+    return null; // unsupported compression
+  }
+  return null; // entry not found
+}
+
+// ================================================================
+// RTF → PLAIN TEXT  (strips RTF control codes for readable preview)
+// ================================================================
+function rtfToPlainText(rtf) {
+  // Group-aware RTF parser (2026-06-12 rewrite).
+  // The old regex stripper leaked font/color-table contents into the
+  // output and dropped \uN unicode escapes (bullets, curly quotes,
+  // apostrophes in every macOS-generated RTF). This walks the source
+  // tracking brace depth and skips ignorable destination groups.
+  const IGNORE = new Set([
+    'fonttbl','colortbl','stylesheet','listtable','listoverridetable',
+    'expandedcolortbl','info','generator','themedata','colorschememapping',
+    'pict','object','header','footer','headerf','footerf','headerl',
+    'headerr','footerl','footerr','filetbl','revtbl','xmlnstbl',
+    'datastore','latentstyles','pgptbl','rsidtbl','mmathPr','operator'
+  ]);
+  const DEST_CHAR = { par:'\n', pard:'', line:'\n', tab:'\t',
+    emdash:'\u2014', endash:'\u2013', bullet:'\u2022',
+    lquote:'\u2018', rquote:'\u2019', ldblquote:'\u201C', rdblquote:'\u201D',
+    emspace:' ', enspace:' ', qmspace:' ', '~':'\u00A0', '-':'', '_':'\u2011' };
+
+  let out = '';
+  let i = 0;
+  let skipDepth = -1;     // brace depth at which an ignored group started
+  let depth = 0;
+  let ucSkip = 1;         // bytes to skip after \uN (set by \ucN)
+  const n = rtf.length;
+
+  while (i < n) {
+    const ch = rtf[i];
+
+    if (ch === '{') { depth++; i++; continue; }
+    if (ch === '}') {
+      if (skipDepth !== -1 && depth === skipDepth) skipDepth = -1;
+      depth--; i++; continue;
+    }
+
+    if (ch === '\\') {
+      // --- escaped literals ---
+      const nx = rtf[i + 1];
+      if (nx === '\\' || nx === '{' || nx === '}') {
+        if (skipDepth === -1) out += nx;
+        i += 2; continue;
+      }
+      // --- \<newline> is an implicit \par (common in macOS RTF) ---
+      if (nx === '\n' || nx === '\r') {
+        if (skipDepth === -1) out += '\n';
+        i += 2; if (nx === '\r' && rtf[i] === '\n') i++;
+        continue;
+      }
+      // --- hex escape \'xx (decode via CP-1252 for 0x80–0x9F) ---
+      if (nx === "'") {
+        const hex = rtf.slice(i + 2, i + 4);
+        if (skipDepth === -1 && /^[0-9a-fA-F]{2}$/.test(hex)) {
+          const code = parseInt(hex, 16);
+          const CP1252 = { 0x85:'\u2026',0x91:'\u2018',0x92:'\u2019',
+            0x93:'\u201C',0x94:'\u201D',0x95:'\u2022',0x96:'\u2013',
+            0x97:'\u2014',0x80:'\u20AC',0x99:'\u2122',0xA0:'\u00A0' };
+          out += CP1252[code] || String.fromCharCode(code);
+        }
+        i += 4; continue;
+      }
+      // --- symbol controls like \~ \- \_ ---
+      if (nx in DEST_CHAR && !/[a-zA-Z]/.test(nx)) {
+        if (skipDepth === -1) out += DEST_CHAR[nx];
+        i += 2; continue;
+      }
+      // --- control word \word[-]N[ ] ---
+      const m = /^\\([a-zA-Z]+)(-?\d+)? ?/.exec(rtf.slice(i));
+      if (m) {
+        const word = m[1];
+        const num  = m[2] !== undefined ? parseInt(m[2], 10) : null;
+
+        // \*\dest — ignorable destination: skip whole group
+        // (the \* appears as the control symbol \* just before)
+        if (skipDepth === -1 && IGNORE.has(word)) {
+          skipDepth = depth;
+        } else if (skipDepth === -1) {
+          if (word === 'uc') {
+            ucSkip = num ?? 1;
+          } else if (word === 'u' && num !== null) {
+            let code = num;
+            if (code < 0) code += 65536;
+            out += String.fromCharCode(code);
+            i += m[0].length;
+            // skip the fallback character(s) following \uN
+            let skipped = 0;
+            while (skipped < ucSkip && i < n) {
+              if (rtf[i] === '\\' && rtf[i + 1] === "'") { i += 4; }
+              else if (rtf[i] !== '{' && rtf[i] !== '}') { i++; }
+              else break;
+              skipped++;
+            }
+            continue;
+          } else if (word in DEST_CHAR) {
+            out += DEST_CHAR[word];
+          } else if (word === 'listtext') {
+            // keep list markers (bullets/numbers live inside this group)
+          }
+        }
+        i += m[0].length; continue;
+      }
+      // --- control symbol \* (ignorable-destination marker) ---
+      if (nx === '*') {
+        // Peek the destination word; if unknown, skip the group anyway —
+        // \* groups are by definition safe to ignore.
+        const dm = /^\\\*\\([a-zA-Z]+)/.exec(rtf.slice(i));
+        if (skipDepth === -1) skipDepth = depth;
+        i += dm ? 2 : 2; continue;
+      }
+      i += 2; continue;   // unknown escape — drop it
+    }
+
+    if (skipDepth === -1 && ch !== '\r' && ch !== '\n') out += ch;
+    i++;
+  }
+
+  // Normalise: collapse 3+ blank lines, trim trailing spaces per line
+  return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ================================================================
+// DOCX PREVIEW  (ZIP → word/document.xml → HTML)
+// ================================================================
+async function previewDocx(fo, content) {
+  const buf = await fo.arrayBuffer();
+  const xmlBuf = await readZipEntry(buf, 'word/document.xml');
+  if (!xmlBuf) throw new Error('word/document.xml not found in ZIP');
+
+  const xmlStr = new TextDecoder().decode(xmlBuf);
+  const dom    = new DOMParser().parseFromString(xmlStr, 'application/xml');
+  const WNS    = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+  // Render a single run with inline formatting (bold / italic / underline)
+  function processRun(run) {
+    const rPr  = run.getElementsByTagNameNS(WNS, 'rPr')[0];
+    const bold = rPr && rPr.getElementsByTagNameNS(WNS, 'b')[0];
+    const ital = rPr && rPr.getElementsByTagNameNS(WNS, 'i')[0];
+    const ulin = rPr && rPr.getElementsByTagNameNS(WNS, 'u')[0];
+    const ts   = run.getElementsByTagNameNS(WNS, 't');
+    let text = '';
+    for (const t of ts) text += t.textContent;
+    if (!text) return '';
+    let h = escH(text);
+    if (bold && bold.getAttribute('w:val') !== 'false') h = `<strong>${h}</strong>`;
+    if (ital && ital.getAttribute('w:val') !== 'false') h = `<em>${h}</em>`;
+    if (ulin && ulin.getAttribute('w:val') && ulin.getAttribute('w:val') !== 'none') h = `<u>${h}</u>`;
+    return h;
+  }
+
+  // Render a paragraph: detect heading style, list item, or plain paragraph
+  function processPara(para) {
+    const pPr      = para.getElementsByTagNameNS(WNS, 'pPr')[0];
+    const pStyleEl = pPr && pPr.getElementsByTagNameNS(WNS, 'pStyle')[0];
+    const style    = pStyleEl ? pStyleEl.getAttribute('w:val') || '' : '';
+    const hMatch   = style.match(/^[Hh]eading\s*(\d)/);
+    const tag      = hMatch ? `h${hMatch[1]}` : 'p';
+    const numPr    = pPr && pPr.getElementsByTagNameNS(WNS, 'numPr')[0];
+    const runs     = para.getElementsByTagNameNS(WNS, 'r');
+    let inner = '';
+    for (const run of runs) inner += processRun(run);
+    if (numPr) return `<li>${inner}</li>`;
+    return `<${tag}>${inner}</${tag}>`;
+  }
+
+  // Render a table
+  function processTable(tbl) {
+    const rows = tbl.getElementsByTagNameNS(WNS, 'tr');
+    let h = '<table class="prev-docx-tbl">';
+    for (const row of rows) {
+      h += '<tr>';
+      const cells = row.getElementsByTagNameNS(WNS, 'tc');
+      for (const cell of cells) {
+        const cellParas = cell.getElementsByTagNameNS(WNS, 'p');
+        let ct = '';
+        for (const cp of cellParas) {
+          const rr = cp.getElementsByTagNameNS(WNS, 'r');
+          for (const r of rr) ct += processRun(r);
+          ct += ' ';
+        }
+        h += `<td>${ct.trim()}</td>`;
+      }
+      h += '</tr>';
+    }
+    return h + '</table>';
+  }
+
+  const body = dom.getElementsByTagNameNS(WNS, 'body')[0];
+  if (!body) throw new Error('No body element found in document.xml');
+
+  const parts = [];
+  let inList = false;
+  for (const child of body.childNodes) {
+    const ln = child.localName;
+    if (ln === 'p') {
+      const rendered = processPara(child);
+      const isList   = rendered.startsWith('<li>');
+      if (isList && !inList)  { parts.push('<ul>'); inList = true; }
+      if (!isList && inList)  { parts.push('</ul>'); inList = false; }
+      parts.push(rendered);
+    } else if (ln === 'tbl') {
+      if (inList) { parts.push('</ul>'); inList = false; }
+      parts.push(processTable(child));
+    }
+  }
+  if (inList) parts.push('</ul>');
+
+  content.style.padding = '0';
+  content.style.alignItems = 'flex-start';
+  content.innerHTML = `<div class="prev-docx">${parts.join('\n')}</div>`;
+}
+
+// ================================================================
+// XLSX PREVIEW  (ZIP → sharedStrings + sheet1 → HTML table)
+// ================================================================
+async function previewXlsx(fo, content) {
+  const buf = await fo.arrayBuffer();
+  const SNS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+
+  // --- Shared strings (may not exist) ---
+  const ssBuf = await readZipEntry(buf, 'xl/sharedStrings.xml');
+  const sharedStrings = [];
+  if (ssBuf) {
+    const ssDoc = new DOMParser().parseFromString(new TextDecoder().decode(ssBuf), 'application/xml');
+    const siEls = ssDoc.getElementsByTagNameNS(SNS, 'si');
+    for (const si of siEls) {
+      // Collect all <t> text nodes within an <si>
+      const tEls = si.getElementsByTagNameNS(SNS, 't');
+      let val = '';
+      for (const t of tEls) val += t.textContent;
+      sharedStrings.push(val);
+    }
+  }
+
+  // --- Sheet 1 ---
+  const shBuf = await readZipEntry(buf, 'xl/worksheets/sheet1.xml');
+  if (!shBuf) throw new Error('sheet1.xml not found');
+
+  const shDoc = new DOMParser().parseFromString(new TextDecoder().decode(shBuf), 'application/xml');
+
+  // Parse cell address like "C5" → { col: 2 (0-based), row: 4 (0-based) }
+  function cellAddr(ref) {
+    const m = ref.match(/^([A-Z]+)(\d+)$/);
+    if (!m) return { col: 0, row: 0 };
+    let col = 0;
+    for (const ch of m[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
+    return { col: col - 1, row: parseInt(m[2]) - 1 };
+  }
+
+  // Build row map
+  const rowMap = new Map(); // rowIndex → Map(colIndex → cellValue)
+  let maxCol = 0;
+
+  const rowEls = shDoc.getElementsByTagNameNS(SNS, 'row');
+  for (const rowEl of rowEls) {
+    const rowIdx = parseInt(rowEl.getAttribute('r') || '1') - 1;
+    const cells  = new Map();
+    const cellEls = rowEl.getElementsByTagNameNS(SNS, 'c');
+    for (const c of cellEls) {
+      const ref  = c.getAttribute('r') || '';
+      const type = c.getAttribute('t') || '';
+      const { col } = cellAddr(ref);
+      const vEl = c.getElementsByTagNameNS(SNS, 'v')[0];
+      let val   = vEl ? vEl.textContent : '';
+      if (type === 's') val = sharedStrings[parseInt(val)] ?? val; // shared string
+      cells.set(col, val);
+      if (col > maxCol) maxCol = col;
+    }
+    rowMap.set(rowIdx, cells);
+  }
+
+  if (!rowMap.size) throw new Error('No data found in sheet');
+
+  const rowIndices = [...rowMap.keys()].sort((a, b) => a - b);
+  const MAX_ROWS   = 300;
+  const truncated  = rowIndices.length > MAX_ROWS;
+  const displayRows = rowIndices.slice(0, MAX_ROWS);
+
+  // Build column header letters (A, B, C …)
+  const colCount = maxCol + 1;
+  let headerHtml = '<tr><th class="row-num">#</th>';
+  for (let c = 0; c < colCount; c++) {
+    let label = '';
+    let n = c + 1;
+    while (n > 0) { label = String.fromCharCode(64 + (n % 26 || 26)) + label; n = Math.floor((n - 1) / 26); }
+    headerHtml += `<th>${escH(label)}</th>`;
+  }
+  headerHtml += '</tr>';
+
+  let bodyHtml = '';
+  for (const ri of displayRows) {
+    const cells = rowMap.get(ri);
+    bodyHtml += `<tr><td class="row-num">${ri + 1}</td>`;
+    for (let c = 0; c < colCount; c++) {
+      const val = cells.get(c) ?? '';
+      const isNum = val !== '' && !isNaN(Number(val));
+      bodyHtml += `<td class="${isNum ? 'num' : ''}" title="${escH(val)}">${escH(val)}</td>`;
+    }
+    bodyHtml += '</tr>';
+  }
+
+  const note = truncated ? `<div style="padding:8px 12px;font-size:11px;color:var(--txt-4)">Showing first ${MAX_ROWS} of ${rowIndices.length} rows</div>` : '';
+
+  content.style.padding = '0';
+  content.style.alignItems = 'flex-start';
+  content.style.overflow = 'hidden';   /* the xlsx wrap is the sole scroller */
+  content.innerHTML = `
+    <div class="prev-xlsx-wrap">
+      <table class="prev-xlsx"><thead>${headerHtml}</thead><tbody>${bodyHtml}</tbody></table>
+      ${note}
+    </div>`;
+}
+
+// ================================================================
+// LEGACY BINARY PREVIEW  (.doc / .xls / .ppt — best-effort text scan)
+// These are proprietary binary formats with no viable in-browser parser.
+// We scan the raw bytes for runs of printable characters as a fallback.
+// ================================================================
+async function previewLegacyBinary(fo, content, ext) {
+  const buf   = await fo.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  const runs  = [];
+
+  // Collect runs of printable ASCII bytes (≥5 chars, must contain real letters)
+  let run = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b >= 32 && b < 127) {
+      run += String.fromCharCode(b);
+    } else {
+      if (run.length >= 5 && /[a-zA-Z]{2,}/.test(run)) runs.push(run.trim());
+      run = '';
+    }
+  }
+  if (run.length >= 5 && /[a-zA-Z]{2,}/.test(run)) runs.push(run.trim());
+
+  // Keep only fragments that look like real words (3+ consecutive letters)
+  const meaningful = runs.filter(s => /[a-zA-Z]{3,}/.test(s) && s.trim().length > 0);
+  const text = meaningful.join('\n');
+
+  if (text.trim().length < 30) {
+    content.innerHTML = `
+      <div class="prev-none">
+        <span class="prev-none-ico">${iconOf(ext, false)}</span>
+        <p>No readable text found in <strong>.${ext}</strong></p>
+        <p style="margin-top:8px;font-size:12px;color:var(--txt-4)">Legacy binary format — open in a desktop application</p>
+      </div>`;
+    return;
+  }
+
+  content.style.padding = '0';
+  content.style.alignItems = 'flex-start';
+  content.innerHTML = `<div class="prev-docx" style="white-space:pre-wrap"><p style="color:var(--txt-4);font-size:11px;padding:10px 14px 6px;margin:0">⚠ Text extracted from legacy binary .${ext} — formatting not preserved</p>${escH(text.slice(0, 80000))}${text.length > 80000 ? '\n\n[… truncated]' : ''}</div>`;
+}
+
+function previewSelected() {
+  const files = getSelFiles().filter(f => !f.isDir);
+  if (!files.length) { toast('Select a file to preview', 'warn'); return; }
+  previewFile(files[0]);
+}
+
+function previewByPath(path) {
+  const f = S.allFiles.find(x => x.path === path);
+  if (f && !f.isDir) { previewFile(f); return; }
+  if (!f)  toast('Preview: file not found in index — try refreshing.', 'warn');
+  if (f && f.isDir) toast('Preview: that is a folder — double-click to open it.', 'info');
+}
+
+// Highlight (and scroll to) the row whose file is shown in the preview pane.
+// Updates classes in place so we don't pay for a full table re-render.
+function markPreviewingRow(path) {
+  document.querySelectorAll('.file-table tbody tr.previewing')
+    .forEach(tr => tr.classList.remove('previewing'));
+  if (!path) return;
+  const tr = document.querySelector(`.file-table tbody tr[data-path="${CSS.escape(path)}"]`);
+  if (tr) {
+    tr.classList.add('previewing');
+    tr.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+// After a rename/refresh the list re-sorts, so the file can jump elsewhere
+// alphabetically. Keep it as the preview/active target and (optionally) scroll
+// it into view. IMPORTANT: this does NOT touch S.selected — selection is the
+// checkbox set, which the user controls deliberately. Marking a file "active"
+// (preview highlight) must not tick its checkbox.
+function keepFocusOnFile(path, opts = {}) {
+  if (!S.allFiles.some(f => f.path === path)) return;
+  S.previewPath = path;
+  // Repaint rows so the indigo "previewing" highlight lands on the new path,
+  // WITHOUT re-running applyFilters (that would re-sort and undo a frozen order).
+  render();
+  updateActionBar();
+  const tr = document.querySelector(`.file-table tbody tr[data-path="${CSS.escape(path)}"]`);
+  if (tr) {
+    tr.classList.add('previewing');
+    if (opts.scroll !== false) tr.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+}
+
+// Rename the currently-previewed file straight from the preview header.
+async function renameFromPreview() {
+  const path = S.previewPath;
+  if (!path) { toast('Open a file in the preview pane first, then click its name to rename.', 'info'); return; }
+  const f = S.allFiles.find(x => x.path === path);
+  if (!f) { toast('Could not find that file — try refreshing the directory.', 'warn'); return; }
+  if (f.isDir) { toast('Folder rename not supported', 'warn'); return; }
+
+  // Prefer the inline editor on the file's row — it pre-selects just the base
+  // name (not the extension). If the row isn't currently rendered, fall back to
+  // the custom rename modal (also base-name-only), NOT the native prompt.
+  const tr = document.querySelector(`.file-table tbody tr[data-path="${CSS.escape(path)}"]`);
+  if (tr) {
+    tr.scrollIntoView({ block: 'nearest' });
+    startInlineRename(path, tr);
+    return;
+  }
+  openRenameModal(path);
+}
+
+// Custom rename modal — used when no inline row is available. Pre-selects the
+// base name (everything before the final dot), unlike a native prompt().
+let _renameModalPath = null;
+function openRenameModal(path) {
+  const f = S.allFiles.find(x => x.path === path);
+  if (!f || f.isDir) { toast('Folder rename not supported', 'warn'); return; }
+  _renameModalPath = path;
+  const inp = document.getElementById('renameInput');
+  inp.value = f.name;
+  document.getElementById('renameDesc').textContent =
+    `Renaming “${f.name}”. Edit the name and press Enter.`;
+  openModal('modalRename');
+  // Focus and select just the base name once the modal is visible.
+  setTimeout(() => {
+    inp.focus();
+    const dot = f.name.lastIndexOf('.');
+    inp.setSelectionRange(0, dot > 0 ? dot : f.name.length);
+  }, 30);
+}
+
+async function commitRenameModal() {
+  const path = _renameModalPath;
+  if (!path) { closeModal('modalRename'); return; }
+  const f = S.allFiles.find(x => x.path === path);
+  const newName = document.getElementById('renameInput').value.trim();
+  closeModal('modalRename');
+  _renameModalPath = null;
+  if (!f || !newName || newName === f.name) return;
+  await _doRename(f, newName);
+}
+
+async function previewFile(f) {
+  const panel   = document.getElementById('previewPanel');
+  const content = document.getElementById('prevContent');
+  const meta    = document.getElementById('prevMeta');
+  if (_prevUrl) { URL.revokeObjectURL(_prevUrl); _prevUrl = null; }
+
+  // Track which file is being previewed and highlight its row live
+  S.previewPath = f.path;
+  markPreviewingRow(f.path);
+  updateActionBar();   // enable Rename for the previewed file
+
+  // Header title doubles as a rename control (click the ✎, or the name)
+  const titleEl = document.getElementById('prevTitle');
+  titleEl.textContent = f.name;
+  titleEl.dataset.path = f.path;
+  const renameBtn = document.getElementById('prevRenameBtn');
+  if (renameBtn) renameBtn.style.display = f.isDir ? 'none' : '';
+  content.innerHTML = '<div style="color:var(--txt-4);font-size:13px">Loading…</div>';
+  content.style.padding = '14px';
+  content.style.alignItems = 'center';
+  content.style.overflow = 'auto';   /* reset — previewXlsx sets this to hidden */
+  panel.classList.add('open');
+  panel.style.minWidth = '460px'; // force reflow so transition fires
+  const dragger = document.getElementById('prevResizeHandle');
+  if (dragger) dragger.classList.add('visible');
+  // Reset rotation from any previous file and show rotation buttons
+  _prevRotation = 0;
+  document.getElementById('prevRotBtns').style.display = '';
+
+  meta.innerHTML = `
+    <span class="prev-meta-k">Type</span>
+    <span class="prev-meta-v">${f.type}${f.ext ? ' .' + f.ext : ''}</span>
+    <span class="prev-meta-k">Size</span>
+    <span class="prev-meta-v">${fmtSize(f.size)}</span>
+    <span class="prev-meta-k">Modified</span>
+    <span class="prev-meta-v">${fmtDate(f.lastMod)}</span>
+    <span class="prev-meta-k">Path</span>
+    <span class="prev-meta-v wrap">${escH(f.path)}</span>`;
+
+  try {
+    const fo  = await f.handle.getFile();
+    const ext = (f.ext || '').toLowerCase();
+
+    if (PREV_IMG.includes(ext)) {
+      const mime = IMG_MIME[ext] || 'application/octet-stream';
+      const buf  = await fo.arrayBuffer();
+      const blob = new Blob([buf], { type: mime });
+      _prevUrl = URL.createObjectURL(blob);
+      const img = document.createElement('img');
+      img.className = 'prev-img';
+      img.alt = f.name;
+      img.onerror = () => {
+        content.innerHTML = `
+          <div class="prev-none">
+            <span class="prev-none-ico">🖼</span>
+            <p>Cannot preview <strong>.${escH(ext)}</strong> in this browser</p>
+            <p style="margin-top:8px;font-size:12px;color:var(--txt-4)">${escH(f.name)}</p>
+          </div>`;
+      };
+      content.innerHTML = '';
+      content.appendChild(img);
+      img.src = _prevUrl;
+      return;
+    }
+
+    if (ext === 'pdf') {
+      // <iframe src="blob:null/..."> is blocked by Chrome's null-origin security model.
+      // window.open(blob:null/...) triggers a download for the same reason.
+      // <embed type="application/pdf"> bypasses this — it routes through Chrome's PDF
+      // plugin directly without creating a new browsing context, so it works on file:// pages.
+      const buf = await fo.arrayBuffer();
+      const pdfBlob = new Blob([buf], { type: 'application/pdf' });
+      _prevUrl = URL.createObjectURL(pdfBlob);
+      content.style.padding = '0';
+      content.style.alignItems = 'stretch';
+      content.innerHTML = `<embed class="prev-pdf" src="${_prevUrl}" type="application/pdf">`;
+      return;
+    }
+
+    if (PREV_VID.includes(ext)) {
+      _prevUrl = URL.createObjectURL(fo);
+      content.innerHTML = `<video class="prev-video" controls src="${_prevUrl}"></video>`;
+      return;
+    }
+
+    if (PREV_AUD.includes(ext)) {
+      _prevUrl = URL.createObjectURL(fo);
+      content.innerHTML = `
+        <div class="prev-audio-wrap">
+          <span class="prev-audio-ico">🎵</span>
+          <div class="prev-audio-name">${escH(f.name)}</div>
+          <audio controls src="${_prevUrl}" style="width:270px"></audio>
+        </div>`;
+      return;
+    }
+
+    if (ext === 'docx') {
+      await previewDocx(fo, content);
+      return;
+    }
+
+    if (ext === 'xlsx') {
+      await previewXlsx(fo, content);
+      return;
+    }
+
+    // Legacy binary Office formats — attempt best-effort text extraction
+    if (['doc','xls','ppt','pps'].includes(ext)) {
+      await previewLegacyBinary(fo, content, ext);
+      return;
+    }
+
+    if (ext === 'rtf') {
+      const raw  = await fo.text();
+      const text = rtfToPlainText(raw);
+      content.style.padding = '0';
+      content.style.alignItems = 'flex-start';
+      content.innerHTML = `<div class="prev-docx" style="white-space:pre-wrap">${escH(text.slice(0, 120000))}${text.length > 120000 ? '\n\n[… truncated]' : ''}</div>`;
+      return;
+    }
+
+    if (PREV_TEXT.includes(ext)) {
+      const text = await fo.text();
+      content.style.padding = '0';
+      content.style.alignItems = 'flex-start';
+      content.innerHTML = `<pre class="prev-text">${escH(text.slice(0, 80000))}${text.length > 80000 ? '\n\n[… truncated]' : ''}</pre>`;
+      return;
+    }
+
+    // No preview available
+    content.innerHTML = `
+      <div class="prev-none">
+        <span class="prev-none-ico">${iconOf(f.ext, false)}</span>
+        <p>No preview for <strong>.${f.ext || 'this file type'}</strong></p>
+        <p style="margin-top:8px;font-size:12px">${fmtSize(f.size)}</p>
+      </div>`;
+  } catch (e) {
+    content.innerHTML = `<div class="prev-none"><span class="prev-none-ico">⚠️</span><p>Could not load preview</p></div>`;
+  }
+}
+
+function closePreview() {
+  const panel = document.getElementById('previewPanel');
+  panel.classList.remove('open');
+  panel.style.width    = '';
+  panel.style.minWidth = '';
+  document.getElementById('prevContent').innerHTML = '';
+  document.getElementById('prevMeta').innerHTML = '';
+  S.previewPath = null;
+  markPreviewingRow(null);
+  const rb = document.getElementById('prevRenameBtn');
+  if (rb) rb.style.display = 'none';
+  const dragger = document.getElementById('prevResizeHandle');
+  if (dragger) dragger.classList.remove('visible');
+  _prevRotation = 0;
+  document.getElementById('prevRotBtns').style.display = 'none';
+  if (_prevUrl) { URL.revokeObjectURL(_prevUrl); _prevUrl = null; }
+  updateActionBar();   // disable Rename now that no file is previewed
+}
+
+// ================================================================
+// FOLDER NAVIGATION
+// ================================================================
+function updateBackBtn() {
+  const btn = document.getElementById('btnBack');
+  if (btn) btn.style.display = S.navStack.length > 0 ? 'inline-flex' : 'none';
+}
+
+async function navigateInto(path) {
+  const f = S.allFiles.find(x => x.path === path && x.isDir);
+  if (!f) { toast('Navigate: folder not found in index — try refreshing.', 'warn'); return; }
+  S.navStack.push(S.rootHandle);
+  S.absPathStack.push(S.rootAbsPath);
+  S.rootHandle = f.handle;
+  S.rootAbsPath = S.rootAbsPath ? S.rootAbsPath + '/' + f.name : '';
+  updateRootPathInput();
+  S.selected.clear();
+  await scanDirectory();
+}
+
+async function navigateBack() {
+  if (!S.navStack.length) return;
+  S.rootHandle = S.navStack.pop();
+  S.rootAbsPath = S.absPathStack.length ? S.absPathStack.pop() : '';
+  updateRootPathInput();
+  S.selected.clear();
+  await scanDirectory();
+}
+
+function initRootPath(dirName) {
+  const stored = localStorage.getItem('fv_rootpath_' + dirName);
+  S.rootAbsPath = stored !== null ? stored : '/Volumes/' + dirName;
+  updateRootPathInput();
+}
+
+function saveRootPath() {
+  if (S.rootHandle) {
+    const key = 'fv_rootpath_' + S.rootHandle.name;
+    localStorage.setItem(key, S.rootAbsPath);
+  }
+}
+
+function updateRootPathInput() {
+  const inp = document.getElementById('rootPathInput');
+  inp.value = S.rootAbsPath;
+  inp.style.display = 'block';
+}
+
+function fileAbsPath(f) {
+  if (!S.rootAbsPath) return null;
+  const rel = f.path.substring(f.path.indexOf('/') + 1);
+  return S.rootAbsPath + (rel ? '/' + rel : '');
+}
+
+// ================================================================
+// HASHING
+// ================================================================
+const ALGOS = ['MD5','SHA-1','SHA-256','SHA-512'];
+
+function hashCellHTML(f) {
+  const h = S.hashes.get(f.path);
+  // No inline onclick — clicks are handled by event delegation on #fileBody
+  if (!h)
+    return `<button class="hash-btn hash-compute" title="Compute ${S.hashAlgo} hash">⊕</button>`;
+  if (h.status === 'computing')
+    return `<span class="hash-spin">⟳</span>`;
+  if (h.status === 'done') {
+    // Show full hash — column width (resizable) controls how much is visible
+    return `<span class="hash-val hash-copy" data-hval="${h.value}" title="${h.algo}: ${h.value}&#10;&#10;Click to copy">${h.value}</span>`
+         + `<button class="hash-btn hash-compute" title="Recompute hash">↺</button>`
+         + `<button class="hash-btn hash-clear"   title="Remove this hash">✕</button>`;
+  }
+  if (h.status === 'error')
+    return `<span style="color:var(--red);font-size:11px" title="${escH(h.msg||'Error')}">⚠</span>`
+         + `<button class="hash-btn hash-clear" title="Clear error">✕</button>`;
+  return '';
+}
+
+function clearHash(path) {
+  S.hashes.delete(path);
+  // Recompute colour groups since this hash is now gone
+  computeHashColorGroups();
+  // Refresh the removed cell and re-tint any rows that were in the same group
+  for (const [p, hid] of S._hcIds) {
+    const cell = document.getElementById(hid);
+    if (!cell) continue;
+    const gi = S.hashColorGroups.get(p);
+    cell.className = 'hash-cell' + (gi !== undefined ? ` hash-group-${gi}` : '');
+    if (p === path) {
+      const f = S.allFiles.find(x => x.path === p);
+      if (f) cell.innerHTML = hashCellHTML(f);
+    }
+  }
+}
+
+function clearAllHashes() {
+  S.hashes.clear();
+  computeHashColorGroups();
+  render();
+  toast('All hashes cleared', 'info');
+}
+
+function updateHashCell(path) {
+  const id = S._hcIds.get(path);
+  if (!id) return;
+  const el = document.getElementById(id);
+  const f  = S.allFiles.find(x => x.path === path);
+  if (!el || !f) return;
+  // Recompute color groups (new hash may create or extend a duplicate group)
+  computeHashColorGroups();
+  // Refresh color class on every visible hash-cell div
+  for (const [p, hid] of S._hcIds) {
+    const cell = document.getElementById(hid);
+    if (!cell) continue;
+    const gi = S.hashColorGroups.get(p);
+    cell.className = 'hash-cell' + (gi !== undefined ? ` hash-group-${gi}` : '');
+  }
+  el.innerHTML = hashCellHTML(f);
+}
+
+async function hashFile(path) {
+  const f = S.allFiles.find(x => x.path === path);
+  if (!f || f.isDir) return;
+  S.hashes.set(path, { status: 'computing' });
+  updateHashCell(path);
+  try {
+    const fo  = await f.handle.getFile();
+    const buf = await fo.arrayBuffer();
+    let value;
+    if (S.hashAlgo === 'MD5') {
+      value = md5(buf);
+    } else {
+      const digest = await crypto.subtle.digest(S.hashAlgo, buf);
+      value = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2,'0')).join('');
+    }
+    S.hashes.set(path, { status: 'done', value, algo: S.hashAlgo });
+  } catch (e) {
+    S.hashes.set(path, { status: 'error', msg: e.message });
+  }
+  updateHashCell(path);
+}
+
+async function hashSelected() {
+  const files = getSelFiles().filter(f => !f.isDir);
+  if (!files.length) return;
+  for (const f of files) {
+    if (S.hashes.get(f.path)?.status === 'done') continue;
+    await hashFile(f.path);
+  }
+  // Full re-render so hash color groups are applied to all visible rows
+  computeHashColorGroups();
+  render();
+  toast(`Hashed ${files.length} file(s) with ${S.hashAlgo}`, 'success');
+}
+
+async function copyHash(hash) {
+  try {
+    await navigator.clipboard.writeText(hash);
+    toast('Hash copied to clipboard', 'success');
+  } catch {
+    prompt('Copy hash value:', hash);
+  }
+}
+
+function toggleAlgoMenu(e) {
+  e.stopPropagation();
+  const existing = document.getElementById('algoDropMenu');
+  if (existing) { existing.remove(); return; }
+  const btn  = e.currentTarget;
+  const rect = btn.getBoundingClientRect();
+  const menu = document.createElement('div');
+  menu.id = 'algoDropMenu';
+  menu.className = 'algo-drop';
+  menu.style.cssText = `top:${rect.bottom + 4}px;left:${rect.left}px`;
+  for (const algo of ALGOS) {
+    const b = document.createElement('button');
+    b.textContent = algo;
+    if (algo === S.hashAlgo) b.className = 'cur';
+    b.onclick = () => {
+      S.hashAlgo = algo;
+      btn.textContent = algo + ' ▾';
+      menu.remove();
+    };
+    menu.appendChild(b);
+  }
+  // Separator + "Clear All Hashes" option
+  const hr  = document.createElement('hr');
+  hr.style.cssText = 'border:none;border-top:1px solid var(--bdr);margin:4px 0';
+  menu.appendChild(hr);
+  const clr = document.createElement('button');
+  clr.textContent = '✕ Clear All Hashes';
+  clr.style.color = 'var(--txt-3)';
+  clr.onclick = () => { menu.remove(); clearAllHashes(); };
+  menu.appendChild(clr);
+
+  document.body.appendChild(menu);
+  setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 10);
+}
+
+let _pendingDel = null;
+function deleteFiles() {
+  const files = getSelFiles();
+  if (!files.length) { toast('Nothing selected', 'warn'); return; }
+  const nf = files.filter(f => !f.isDir).length;
+  const nd = files.filter(f => f.isDir).length;
+  let msg = 'Move to Trash: ';
+  if (nf) msg += `${nf} file${nf>1?'s':''}`;
+  if (nf && nd) msg += ' and ';
+  if (nd) msg += `${nd} folder${nd>1?'s':''}`;
+  if (!S.rootAbsPath) msg += '<br><small style="color:var(--red)">⚠ Set the root path in the header bar first.</small>';
+  document.getElementById('delDesc').innerHTML = msg;
+  _pendingDel = files;
+  openModal('modalDelete');
+}
+
+async function confirmDelete() {
+  closeModal('modalDelete');
+  if (!_pendingDel) return;
+  const files = _pendingDel; _pendingDel = null;
+
+  if (!S.rootAbsPath) {
+    toast('Root path not set — enter the full path in the header bar so files can be trashed safely.', 'warn');
+    return;
+  }
+
+  const paths = files.map(f => fileAbsPath(f));
+  showProg('Moving to Trash', `Sending ${files.length} item(s) to Trash…`);
+  try {
+    const res = await fetch('http://localhost:8765/api/trash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths })
+    });
+    if (!res.ok) throw new Error('Server responded ' + res.status);
+    const data = await res.json();
+    const ok   = data.results.filter(r => r.ok).length;
+    const fail = data.results.filter(r => !r.ok).length;
+    data.results.forEach((r, i) => {
+      if (r.ok) { S.selected.delete(files[i].path); S.hashes.delete(files[i].path); }
+    });
+    closeModal('modalProg');
+    fail === 0
+      ? toast(`Moved ${ok} item(s) to Trash`, 'success')
+      : toast(`Trashed ${ok}, failed ${fail} — check console`, 'warn');
+    await refreshDirectory();
+  } catch (e) {
+    closeModal('modalProg');
+    toast('Could not reach server.py — run it first: python3 server.py', 'error');
+  }
+}
+
+// ================================================================
+// STATS
+// ================================================================
+function updateStats() {
+  const files = S.allFiles.filter(f => !f.isDir);
+  const dirs  = S.allFiles.filter(f => f.isDir);
+  const total = files.reduce((s, f) => s + f.size, 0);
+  document.getElementById('stFiles').textContent  = files.length.toLocaleString();
+  document.getElementById('stDirs').textContent   = dirs.length.toLocaleString();
+  document.getElementById('stSize').textContent   = fmtSize(total);
+}
+function updateStatFiltered() {
+  const el = document.getElementById('stFiltered');
+  if (S.query || S.activeType !== 'all')
+    el.textContent = `Showing ${S.filtered.length} of ${S.allFiles.length}`;
+  else el.textContent = '';
+}
+
+// ================================================================
+// MODALS
+// ================================================================
+function openModal(id)  { document.getElementById(id).classList.add('show'); }
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+function showHelp()     { openModal('modalHelp'); }
+
+function showProg(title, desc) {
+  document.getElementById('progTitle').textContent = title;
+  document.getElementById('progDesc').textContent  = desc;
+  setProg(0);
+  openModal('modalProg');
+}
+function setProg(pct) { document.getElementById('progFill').style.width = pct + '%'; }
+
+// ================================================================
+// LOADING BAR
+// ================================================================
+function setLoading(on) {
+  const bar = document.getElementById('loadBar');
+  if (on) { bar.style.width = '30%'; bar.style.opacity = '1'; setTimeout(() => bar.style.width = '72%', 400); }
+  else    { bar.style.width = '100%'; setTimeout(() => { bar.style.width = '0'; bar.style.opacity = '0'; }, 350); }
+}
+
+// ================================================================
+// TOASTS
+// ================================================================
+function toast(msg, type = 'info') {
+  const icons = { success:'✅', error:'❌', warn:'⚠️', info:'ℹ️' };
+  const c = document.getElementById('toasts');
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.innerHTML = `<span>${icons[type]||''}</span><span>${msg}</span>`;
+  c.appendChild(t);
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 4200);
+}
+
+// ================================================================
+// UTILITIES
+// ================================================================
+function fmtSize(b) {
+  if (b === 0) return '0 B';
+  const u = ['B','KB','MB','GB','TB'];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return (b / 1024 ** i).toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+}
+
+function fmtDate(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts), now = new Date(), diff = now - d;
+  if (diff < 60000)    return 'Just now';
+  if (diff < 3600000)  return Math.floor(diff / 60000)   + 'm ago';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+  if (diff < 604800000)return Math.floor(diff / 86400000)+ 'd ago';
+  return d.toLocaleDateString('en-US', { month:'short', day:'numeric',
+    year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
+}
+
+function escH(s) {
+  const d = document.createElement('div');
+  d.appendChild(document.createTextNode(String(s)));
+  return d.innerHTML;
+}
+function esc(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+
+// ================================================================
+// KEYBOARD SHORTCUTS
+// ================================================================
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.overlay.show').forEach(m => m.classList.remove('show'));
+    if (document.getElementById('previewPanel').classList.contains('open')) { closePreview(); return; }
+    if (S.selected.size) clearSel();
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'a' && document.activeElement.tagName !== 'INPUT') {
+    e.preventDefault(); selectAll();
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') &&
+       document.activeElement.tagName !== 'INPUT' && S.selected.size > 0) {
+    deleteFiles();
+  }
+});
+
+// ================================================================
+// MD5 — RFC 1321, pure JS
+// ================================================================
+function md5(buffer) {
+  const b  = new Uint8Array(buffer);
+  const ol = b.length;
+  const pl = Math.ceil((ol + 9) / 64) * 64;
+  const p  = new Uint8Array(pl);
+  p.set(b); p[ol] = 0x80;
+  const dv = new DataView(p.buffer);
+  dv.setUint32(pl - 8, (ol * 8) >>> 0, true);
+  dv.setUint32(pl - 4, Math.floor(ol / 0x20000000), true);
+  const SH = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+              5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+              4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+              6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+  const K  = Array.from({length:64}, (_,i) => (Math.abs(Math.sin(i+1)) * 2**32) >>> 0);
+  let [a0,b0,c0,d0] = [0x67452301,0xefcdab89,0x98badcfe,0x10325476];
+  for (let off = 0; off < pl; off += 64) {
+    const M = Array.from({length:16}, (_,j) => dv.getUint32(off + j*4, true));
+    let [a,b,c,d] = [a0,b0,c0,d0];
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if      (i<16) { F=(b&c)|(~b&d); g=i; }
+      else if (i<32) { F=(d&b)|(~d&c); g=(5*i+1)%16; }
+      else if (i<48) { F=b^c^d;        g=(3*i+5)%16; }
+      else           { F=c^(b|~d);     g=(7*i)%16; }
+      const t=d; d=c; c=b;
+      const s=((F+a+K[i]+M[g])|0);
+      b=(b+((s<<SH[i])|(s>>>(32-SH[i]))))|0; a=t;
+    }
+    a0=(a0+a)|0; b0=(b0+b)|0; c0=(c0+c)|0; d0=(d0+d)|0;
+  }
+  return [a0,b0,c0,d0].map(w => {
+    let h=''; for(let i=0;i<4;i++) h+=((w>>>(i*8))&0xff).toString(16).padStart(2,'0'); return h;
+  }).join('');
+}
+
+// ================================================================
+// EVENT DELEGATION — table body (click = preview file, dblclick = open folder)
+// ================================================================
+(function() {
+  const tbody = document.getElementById('fileBody');
+
+  // Single-click: name cell → preview file / hash buttons / copy hash
+  tbody.addEventListener('click', function(e) {
+    // Hash: compute / recompute button
+    if (e.target.closest('.hash-compute')) {
+      const cell = e.target.closest('.hash-cell[data-path]');
+      if (cell) hashFile(cell.dataset.path);
+      return;
+    }
+    // Hash: clear (remove) button
+    if (e.target.closest('.hash-clear')) {
+      const cell = e.target.closest('.hash-cell[data-path]');
+      if (cell) clearHash(cell.dataset.path);
+      return;
+    }
+    // Hash: copy value span
+    if (e.target.closest('.hash-copy')) {
+      const span = e.target.closest('.hash-copy');
+      if (span && span.dataset.hval) copyHash(span.dataset.hval);
+      return;
+    }
+    // Name click → preview + make it the ACTIVE file (drives the indigo
+    // highlight and the bottom Rename target). This does NOT tick the checkbox —
+    // checkboxes are a separate, deliberate multi-select for batch Copy/Move/Delete.
+    const nameEl = e.target.closest('.f-name-link');
+    if (!nameEl) return;
+    const tr = e.target.closest('tr');
+    if (!tr || !tr.dataset.path) return;
+    if (tr.dataset.isdir === '1') return; // folders need dblclick
+    previewByPath(tr.dataset.path);   // sets S.previewPath + previewing highlight
+  });
+
+  // Double-click on name cell → navigate into folder OR preview file
+  tbody.addEventListener('dblclick', function(e) {
+    const nameEl = e.target.closest('.f-name-link');
+    if (!nameEl) return;
+    const tr = e.target.closest('tr');
+    if (!tr || !tr.dataset.path) return;
+    if (tr.dataset.isdir === '1') navigateInto(tr.dataset.path);
+    else previewByPath(tr.dataset.path);
+  });
+
+  // Checkbox change via delegation on tbody (avoids inline JS in innerHTML)
+  tbody.addEventListener('change', function(e) {
+    const cb = e.target.closest('input.cb');
+    if (!cb) return;
+    const tr = e.target.closest('tr');
+    if (!tr || !tr.dataset.path) return;
+    toggleSel(tr.dataset.path);
+  });
+
+  // Right-click on a file name → context menu
+  tbody.addEventListener('contextmenu', function(e) {
+    const nameEl = e.target.closest('.f-name-link');
+    if (!nameEl) return;
+    const tr = e.target.closest('tr');
+    if (!tr || !tr.dataset.path) return;
+    e.preventDefault();
+    const path   = tr.dataset.path;
+    const isDir  = tr.dataset.isdir === '1';
+    const menu   = document.getElementById('ctxMenu');
+
+    // Position near the cursor, keeping within the viewport
+    menu.style.display = 'block';
+    menu.style.left = e.clientX + 'px';
+    menu.style.top  = e.clientY + 'px';
+    requestAnimationFrame(() => {
+      const r = menu.getBoundingClientRect();
+      if (r.right  > window.innerWidth)  menu.style.left = (e.clientX - r.width)  + 'px';
+      if (r.bottom > window.innerHeight) menu.style.top  = (e.clientY - r.height) + 'px';
+    });
+
+    // Wire up actions
+    document.getElementById('ctxRename').onclick  = () => { menu.style.display='none'; if(!isDir) startInlineRename(path, tr); };
+    document.getElementById('ctxPreview').onclick = () => { menu.style.display='none'; if(!isDir) previewByPath(path); };
+    document.getElementById('ctxCopy').onclick    = () => { menu.style.display='none'; if(!S.selected.has(path)) toggleSel(path); copyFiles(); };
+    document.getElementById('ctxDelete').onclick  = () => { menu.style.display='none'; if(!S.selected.has(path)) toggleSel(path); deleteFiles(); };
+
+    // Disable Rename for folders
+    document.getElementById('ctxRename').disabled = isDir;
+
+    // Dismiss on any click outside the menu
+    setTimeout(() => document.addEventListener('click', () => { menu.style.display='none'; }, { once: true }), 10);
+  });
+})();
+
+// ================================================================
+// EVENT DELEGATION — grid (dblclick = open folder or preview file)
+// ================================================================
+(function() {
+  const grd = document.getElementById('fileGrid');
+
+  grd.addEventListener('dblclick', function(e) {
+    // Ignore dblclick directly on the checkbox
+    if (e.target.closest('input.cb')) return;
+    const card = e.target.closest('.grid-card[data-path]');
+    if (!card) return;
+    if (card.dataset.isdir === '1') navigateInto(card.dataset.path);
+    else previewByPath(card.dataset.path);
+  });
+
+  // Checkbox change in grid cards
+  grd.addEventListener('change', function(e) {
+    const cb = e.target.closest('input.cb');
+    if (!cb) return;
+    const card = e.target.closest('.grid-card[data-path]');
+    if (!card) return;
+    toggleSel(card.dataset.path);
+  });
+})();
+
+// ================================================================
+// COLUMN SYSTEM INIT
+// ================================================================
+rebuildColGroup();
+renderHead();
+
+// ================================================================
+// API CHECK ON LOAD
+// ================================================================
+if (!('showDirectoryPicker' in window)) {
+  document.getElementById('apiWarn').style.display = 'block';
+  document.getElementById('apiWarn').textContent =
+    '⚠️ Your browser does not support the File System Access API. ' +
+    'Please open this file in Google Chrome, Microsoft Edge, or Brave.';
+}
+
+// ================================================================
+// PREVIEW PANEL — DRAG-TO-RESIZE
+// The dragger sits as a flex sibling to the left of the preview panel.
+// Dragging left widens the panel; dragging right narrows it.
+// ================================================================
+(function() {
+  const handle = document.getElementById('prevResizeHandle');
+  const panel  = document.getElementById('previewPanel');
+  if (!handle || !panel) return;
+
+  handle.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panel.offsetWidth;
+    handle.classList.add('active');
+    document.body.classList.add('panel-resizing');
+
+    const onMove = ev => {
+      // Dragger is to the LEFT of the panel.
+      // Moving mouse left (smaller clientX) → startX - ev.clientX > 0 → wider panel.
+      const delta = startX - ev.clientX;
+      const w = Math.max(280, Math.min(window.innerWidth * 0.75, startW + delta));
+      panel.style.width    = w + 'px';
+      panel.style.minWidth = w + 'px';
+    };
+    const onUp = () => {
+      handle.classList.remove('active');
+      document.body.classList.remove('panel-resizing');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup',   onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup',   onUp);
+  });
+})();
+</script>
+</body>
+</html>
