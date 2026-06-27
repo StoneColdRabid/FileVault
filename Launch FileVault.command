@@ -2,20 +2,44 @@
 # FileVault — start the local server and open in a supported browser.
 #
 # IMPORTANT: FileVault relies on the File System Access API, which Safari and
-# Firefox do NOT support. Safari also force-upgrades localhost to HTTPS, which
-# is why it refused to load over http://. So we deliberately open the app in
-# Chrome / Brave / Edge — NOT the system default browser.
+# Firefox do NOT support. So we deliberately open the app in Chrome / Brave / Edge.
 
-PROJECT="/Volumes/PRO-G-HomeX/Claude/Projects/HTML 001"
-URL="http://localhost:8765/FileVault.html"
+PROJECT="$(cd "$(dirname "$0")" && pwd)"
+PORT_FILE="$HOME/.filevault_port"
+URL=""
 
-# Start the server if it isn't already running
-if lsof -i :8765 -t > /dev/null 2>&1; then
-    echo "Server already running on port 8765."
-else
-    echo "Starting FileVault server on http://localhost:8765..."
+# If a port file exists, check whether that server is still running.
+if [ -f "$PORT_FILE" ]; then
+    CACHED_PORT=$(cat "$PORT_FILE")
+    if lsof -i :"$CACHED_PORT" -t > /dev/null 2>&1; then
+        echo "Server already running on port $CACHED_PORT."
+        URL="http://localhost:$CACHED_PORT/FileVault.html"
+    else
+        rm -f "$PORT_FILE"
+    fi
+fi
+
+# Start the server if we don't have a live one.
+if [ -z "$URL" ]; then
+    echo "Starting FileVault server..."
     /opt/homebrew/bin/python3 "$PROJECT/server.py" &
-    sleep 1
+
+    # Wait for server.py to write its chosen port (up to 3 s).
+    PORT=""
+    for i in $(seq 1 15); do
+        sleep 0.2
+        if [ -f "$PORT_FILE" ]; then
+            PORT=$(cat "$PORT_FILE")
+            break
+        fi
+    done
+
+    if [ -z "$PORT" ]; then
+        echo "ERROR: Server did not start in time."
+        exit 1
+    fi
+
+    URL="http://localhost:$PORT/FileVault.html"
 fi
 
 # Find a supported (Chromium-based) browser, in order of preference.

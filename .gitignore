@@ -9,3 +9,10 @@
 # Python
 __pycache__/
 *.pyc
+
+# Personal / private
+CLAUDE.md
+Feature Requests.md
+FileVault Build Conversation.pdf
+Archive/
+Screenshots/

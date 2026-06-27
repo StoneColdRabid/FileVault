@@ -134,6 +134,10 @@ header {
 }
 .root-path-input::placeholder { color: var(--txt-4); }
 .root-path-input:focus { border-color: var(--gold-b); color: var(--txt-1); }
+.btn-pick-path { flex-shrink:0; padding:4px 7px; font-size:13px; line-height:1;
+  background:var(--bg-3); border:1px solid var(--bdr); border-radius:var(--r);
+  color:var(--txt-2); cursor:pointer; margin-right:8px; display:none; }
+.btn-pick-path:hover { border-color:var(--gold-b); color:var(--gold); }
 
 /* ================================================================
    BUTTONS
@@ -865,7 +869,8 @@ body.panel-resizing * { cursor: ew-resize !important; user-select: none !importa
         <div class="empty-ico">📂</div>
         <div class="empty-title">No Directory Selected</div>
         <div class="empty-desc">Click <strong>Open Directory</strong> to browse a folder or drive. Files are organized by type and you can copy, move, rename, or delete them locally.</div>
-        <button class="btn btn-primary" onclick="openDirectory()">📂 Open Directory</button>
+        <button class="btn btn-primary" id="btnReopen" style="display:none" onclick="reopenLastDir()">↩ Reopen Last Folder</button>
+        <button class="btn btn-sec" onclick="openDirectory()" id="btnOpenDir2">📂 Open Directory</button>
         <div id="apiWarn" style="display:none;color:var(--red);font-size:12px;margin-top:8px;max-width:340px;line-height:1.6"></div>
       </div>
 
@@ -1062,6 +1067,74 @@ body.panel-resizing * { cursor: ew-resize !important; user-select: none !importa
 'use strict';
 
 // ================================================================
+// HANDLE PERSISTENCE (IndexedDB)
+// ================================================================
+const _IDB = (() => {
+  let _db = null;
+  function open() {
+    if (_db) return Promise.resolve(_db);
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('filevault', 1);
+      r.onupgradeneeded = e => e.target.result.createObjectStore('handles');
+      r.onsuccess = e => { _db = e.target.result; res(_db); };
+      r.onerror   = e => rej(e.target.error);
+    });
+  }
+  return {
+    save: async h => { const db = await open(); return new Promise((res,rej) => { const tx=db.transaction('handles','readwrite'); tx.objectStore('handles').put(h,'root'); tx.oncomplete=res; tx.onerror=e=>rej(e.target.error); }); },
+    load: async () => { const db = await open(); return new Promise((res,rej) => { const tx=db.transaction('handles','readonly'); const r=tx.objectStore('handles').get('root'); r.onsuccess=e=>res(e.target.result||null); r.onerror=e=>rej(e.target.error); }); },
+    clear: async () => { const db = await open(); return new Promise((res,rej) => { const tx=db.transaction('handles','readwrite'); tx.objectStore('handles').delete('root'); tx.oncomplete=res; tx.onerror=e=>rej(e.target.error); }); },
+  };
+})();
+
+async function autoDetectRootPath(dirName) {
+  try {
+    const res = await fetch(`http://localhost:8765/api/find-dir?name=${encodeURIComponent(dirName)}`);
+    const data = await res.json();
+    if (data.path) {
+      S.rootAbsPath = data.path;
+      saveRootPath();
+    }
+  } catch { /* server not running — user can set path manually */ }
+}
+
+async function tryRestoreLastDir() {
+  let handle;
+  try { handle = await _IDB.load(); } catch { return; }
+  if (!handle) return;
+  const perm = await handle.queryPermission({ mode: 'readwrite' }).catch(() => 'denied');
+  if (perm === 'granted') {
+    S.rootHandle = handle;
+    initRootPath(handle.name);
+    autoDetectRootPath(handle.name);
+    await scanDirectory();
+  } else {
+    // Show reopen button with the saved folder name
+    const btn = document.getElementById('btnReopen');
+    btn.textContent = `↩ Reopen "${handle.name}"`;
+    btn.style.display = 'inline-flex';
+    btn._handle = handle;
+  }
+}
+
+async function reopenLastDir() {
+  const btn = document.getElementById('btnReopen');
+  const handle = btn._handle;
+  if (!handle) return;
+  const perm = await handle.requestPermission({ mode: 'readwrite' }).catch(() => 'denied');
+  if (perm === 'granted') {
+    S.rootHandle = handle;
+    initRootPath(handle.name);
+    autoDetectRootPath(handle.name);
+    await scanDirectory();
+  } else {
+    toast('Permission denied — use Open Directory to pick the folder again', 'warn');
+    await _IDB.clear();
+    btn.style.display = 'none';
+  }
+}
+
+// ================================================================
 // STATE
 // ================================================================
 const S = {
@@ -1140,6 +1213,8 @@ async function doOpenDirectory() {
     S.absPathStack = [];
     initRootPath(h.name);
     updateBackBtn();
+    _IDB.save(h).catch(() => {});
+    autoDetectRootPath(h.name);
     await scanDirectory();
   } catch (e) {
     if (e.name !== 'AbortError') toast('Could not open directory: ' + e.message, 'error');
@@ -1427,6 +1502,10 @@ function applyFilters() {
         case 'hash': {
           const ha = S.hashes.get(a.path);
           const hb = S.hashes.get(b.path);
+          // Files with duplicates sort before unique files
+          const aDup = S.hashColorGroups.has(a.path) ? 0 : 1;
+          const bDup = S.hashColorGroups.has(b.path) ? 0 : 1;
+          if (aDup !== bDup) return (aDup - bDup) * (level.dir === 'asc' ? 1 : -1);
           va = ha?.status === 'done' ? ha.value : '\uFFFF';
           vb = hb?.status === 'done' ? hb.value : '\uFFFF';
           break;
@@ -2936,40 +3015,56 @@ function deleteFiles() {
   openModal('modalDelete');
 }
 
+async function _getHandleByRel(rel) {
+  const parts = rel.split('/').filter(Boolean);
+  let handle = S.rootHandle;
+  for (let i = 0; i < parts.length - 1; i++) {
+    handle = await handle.getDirectoryHandle(parts[i]);
+  }
+  return { parent: handle, name: parts[parts.length - 1] };
+}
+
 async function confirmDelete() {
   closeModal('modalDelete');
   if (!_pendingDel) return;
   const files = _pendingDel; _pendingDel = null;
 
-  if (!S.rootAbsPath) {
-    toast('Root path not set — enter the full path in the header bar so files can be trashed safely.', 'warn');
+  if (!S.rootHandle) {
+    toast('No directory open — open a folder first.', 'warn');
     return;
   }
 
-  const paths = files.map(f => fileAbsPath(f));
   showProg('Moving to Trash', `Sending ${files.length} item(s) to Trash…`);
-  try {
-    const res = await fetch('http://localhost:8765/api/trash', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths })
-    });
-    if (!res.ok) throw new Error('Server responded ' + res.status);
-    const data = await res.json();
-    const ok   = data.results.filter(r => r.ok).length;
-    const fail = data.results.filter(r => !r.ok).length;
-    data.results.forEach((r, i) => {
-      if (r.ok) { S.selected.delete(files[i].path); S.hashes.delete(files[i].path); }
-    });
-    closeModal('modalProg');
-    fail === 0
-      ? toast(`Moved ${ok} item(s) to Trash`, 'success')
-      : toast(`Trashed ${ok}, failed ${fail} — check console`, 'warn');
-    await refreshDirectory();
-  } catch (e) {
-    closeModal('modalProg');
-    toast('Could not reach server.py — run it first: python3 server.py', 'error');
+  let ok = 0, fail = 0;
+  for (const f of files) {
+    try {
+      const rel = f.path.substring(f.path.indexOf('/') + 1);
+      const { parent, name } = await _getHandleByRel(rel);
+      const fh = await parent.getFileHandle(name);
+      const file = await fh.getFile();
+      const buf = await file.arrayBuffer();
+      const res = await fetch(`http://localhost:8765/api/trash-upload?name=${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: buf
+      });
+      if (!res.ok) throw new Error('Server ' + res.status);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'unknown');
+      await parent.removeEntry(name);
+      S.selected.delete(f.path);
+      S.hashes.delete(f.path);
+      ok++;
+    } catch (e) {
+      console.error('Trash failed for', f.name, e);
+      fail++;
+    }
   }
+  closeModal('modalProg');
+  fail === 0
+    ? toast(`Moved ${ok} item(s) to Trash`, 'success')
+    : toast(`Trashed ${ok}, failed ${fail} — check console`, 'warn');
+  await refreshDirectory();
 }
 
 // ================================================================
@@ -3241,6 +3336,8 @@ if (!('showDirectoryPicker' in window)) {
   document.getElementById('apiWarn').textContent =
     '⚠️ Your browser does not support the File System Access API. ' +
     'Please open this file in Google Chrome, Microsoft Edge, or Brave.';
+} else {
+  tryRestoreLastDir();
 }
 
 // ================================================================
