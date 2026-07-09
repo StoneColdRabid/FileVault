@@ -971,10 +971,17 @@ body.panel-resizing * { cursor: ew-resize !important; user-select: none !importa
     </div>
     <div class="modal-actions">
       <button class="btn btn-sec" onclick="closeModal('modalOpenDir')">Cancel</button>
-      <button class="btn btn-primary" onclick="doOpenDirectory()">Choose Folder…</button>
+      <button class="btn btn-primary" id="btnChooseFolder" onclick="doOpenDirectory()">Choose Folder…</button>
+      <button class="btn btn-sec" id="btnChooseFolderRO" style="display:none" onclick="document.getElementById('safariDirInput').click()">Browse Folder…</button>
+    </div>
+    <div class="modal-desc" id="safariNotice" style="display:none; margin-top:8px; color:var(--orange)">
+      ⚠️ Safari can't grant this page writable file access directly. Rename/move/copy/delete are instead sent to the local FileVault server (server.py) to perform — type the folder's absolute path into the header bar first so the server can find it.
     </div>
   </div>
 </div>
+
+<!-- Hidden input for the Safari read-only fallback (webkitdirectory gives File objects, no write access) -->
+<input type="file" id="safariDirInput" webkitdirectory multiple style="display:none">
 
 <!-- Rename (custom — pre-selects just the base name, unlike native prompt) -->
 <div class="overlay" id="modalRename" onclick="if(event.target===this)closeModal('modalRename')">
@@ -1098,6 +1105,132 @@ async function autoDetectRootPath(dirName) {
   } catch { /* server not running — user can set path manually */ }
 }
 
+// Returns the underlying File for a file entry, whether it came from a real
+// FileSystemFileHandle (Chrome/Edge/Brave) or was captured directly as a File
+// object in the Safari read-only fallback (S.readOnly / f.fileObj).
+async function getFileObj(f) {
+  return f.fileObj ? f.fileObj : await f.handle.getFile();
+}
+
+// ================================================================
+// ACTION LOG — records renames, moves, and deletes with an ISO timestamp
+// via the local server's /api/log endpoint. Best-effort: if the server
+// is unreachable, the file operation still proceeds; only the log entry
+// is skipped.
+// ================================================================
+async function logAction(action, detail) {
+  try {
+    await fetch('http://localhost:8765/api/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, detail, timestamp: new Date().toISOString() })
+    });
+  } catch { /* server not running — action still succeeded, just not logged */ }
+}
+
+// ================================================================
+// SAFARI WRITE FALLBACK
+// Safari has no writable directory handles (no showDirectoryPicker at all),
+// so rename/move/copy/delete are routed to server.py, which performs them
+// with os/shutil. Every request is scoped to S.rootAbsPath — the server
+// re-validates that the target path actually resolves under that root
+// (see resolve_under_root in server.py) before touching anything, and the
+// server also rejects any request whose Origin header isn't this same app.
+// ================================================================
+
+// f.path is a webkitRelativePath like "MyFolder/sub/file.txt". S.rootAbsPath
+// must be the absolute path of "MyFolder" itself (typed into the header path
+// pill) for this to resolve to a real filesystem path.
+function safariAbsPath(f) {
+  const rel = f.path.substring(f.path.indexOf('/') + 1);
+  return S.rootAbsPath.replace(/\/$/, '') + '/' + rel;
+}
+
+function requireRootAbsPath() {
+  if (!S.rootAbsPath) {
+    toast('Set the absolute folder path in the header bar first (Safari can\'t supply it automatically).', 'warn');
+    return false;
+  }
+  return true;
+}
+
+async function _doRenameSafari(f, newName) {
+  if (!requireRootAbsPath()) return;
+  try {
+    const res = await fetch('http://localhost:8765/api/write/rename', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: S.rootAbsPath, path: safariAbsPath(f), newName })
+    });
+    const data = await res.json();
+    if (!data.ok) { toast(`Rename failed: ${data.error || 'unknown error'}`, 'error'); return; }
+    toast(`Renamed to "${newName}"`, 'success');
+    await refreshSafariDir();
+  } catch (e) {
+    toast('Rename failed — is the FileVault server running?', 'error');
+  }
+}
+
+async function _doMoveSafari(files, destDir) {
+  let ok = 0, fail = 0;
+  for (const f of files) {
+    try {
+      const res = await fetch('http://localhost:8765/api/write/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root: S.rootAbsPath, path: safariAbsPath(f), destDir })
+      });
+      const data = await res.json();
+      if (data.ok) { ok++; S.selected.delete(f.path); } else { fail++; console.error(data.error); }
+    } catch (e) { fail++; console.error(e); }
+  }
+  fail === 0 ? toast(`Moved ${ok} file(s)`, 'success') : toast(`Moved ${ok}, failed ${fail}`, 'warn');
+  await refreshSafariDir();
+}
+
+async function _doCopySafari(files, destDir) {
+  let ok = 0, fail = 0;
+  for (const f of files) {
+    try {
+      const res = await fetch('http://localhost:8765/api/write/copy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root: S.rootAbsPath, path: safariAbsPath(f), destDir })
+      });
+      const data = await res.json();
+      if (data.ok) ok++; else { fail++; console.error(data.error); }
+    } catch (e) { fail++; console.error(e); }
+  }
+  fail === 0 ? toast(`Copied ${ok} file(s)`, 'success') : toast(`Copied ${ok}, failed ${fail}`, 'warn');
+}
+
+async function _doDeleteSafari(files) {
+  if (!requireRootAbsPath()) return;
+  try {
+    const res = await fetch('http://localhost:8765/api/trash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: S.rootAbsPath, paths: files.map(safariAbsPath) })
+    });
+    const data = await res.json();
+    const ok = data.results.filter(r => r.ok).length;
+    const fail = data.results.length - ok;
+    files.forEach(f => S.selected.delete(f.path));
+    fail === 0 ? toast(`Moved ${ok} item(s) to Trash`, 'success') : toast(`Trashed ${ok}, failed ${fail} — check console`, 'warn');
+    if (fail) console.error('Trash failures:', data.results.filter(r => !r.ok));
+    await refreshSafariDir();
+  } catch (e) {
+    toast('Delete failed — is the FileVault server running?', 'error');
+  }
+}
+
+// Re-reads the currently open folder in Safari mode by re-prompting the
+// user via the same webkitdirectory input (there's no live handle to
+// re-scan silently, unlike Chrome's refreshDirectory()).
+async function refreshSafariDir() {
+  toast('Re-select the folder to refresh the file list', 'info');
+}
+
 async function tryRestoreLastDir() {
   let handle;
   try { handle = await _IDB.load(); } catch { return; }
@@ -1158,7 +1291,8 @@ const S = {
   navStack:      [],
   hashColorGroups: new Map(),
   rootAbsPath:   '',
-  absPathStack:  []
+  absPathStack:  [],
+  readOnly:      false  // true in the Safari fallback mode (webkitdirectory) — write ops disabled
 };
 
 // ================================================================
@@ -1195,12 +1329,47 @@ function colorOf(type) { return TYPES[type]?.color ?? '#6e7681'; }
 // DIRECTORY OPEN
 // ================================================================
 function openDirectory() {
-  if (!('showDirectoryPicker' in window)) {
-    toast('Your browser does not support the File System Access API. Please use Chrome, Edge, or Brave.', 'error');
-    return;
-  }
+  const supportsWrite = 'showDirectoryPicker' in window;
+  document.getElementById('btnChooseFolder').style.display = supportsWrite ? '' : 'none';
+  document.getElementById('btnChooseFolderRO').style.display = supportsWrite ? 'none' : '';
+  document.getElementById('safariNotice').style.display = supportsWrite ? 'none' : '';
   openModal('modalOpenDir');
 }
+
+// Safari / any browser without the File System Access API: fall back to
+// <input webkitdirectory>, which yields a flat FileList (no live handles).
+// Read (browse/preview/hash) works; write ops (rename/move/copy/delete) do
+// not, because WebKit does not expose writable directory handles — there is
+// no JS-side polyfill for that; it requires browser-vendor support.
+document.getElementById('safariDirInput').addEventListener('change', async (e) => {
+  const fileList = Array.from(e.target.files || []);
+  if (!fileList.length) return;
+  closeModal('modalOpenDir');
+  S.readOnly = true;
+  S.rootHandle = null;
+  S.selected.clear();
+  S.navStack = [];
+  S.absPathStack = [];
+  const rootName = (fileList[0].webkitRelativePath || fileList[0].name).split('/')[0];
+  initRootPath(rootName + ' (Safari)');
+  updateBackBtn();
+  S.allFiles = fileList.map(file => {
+    const rel = file.webkitRelativePath || file.name;
+    const parts = rel.split('/');
+    const name = parts[parts.length - 1];
+    const folder = parts.slice(0, -1).join('/');
+    const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+    return {
+      name, ext, type: typeOf(ext),
+      size: file.size, lastMod: file.lastModified,
+      path: rel, folder,
+      handle: null, parentHandle: null, fileObj: file,
+      isDir: false
+    };
+  });
+  applyFilters();
+  toast(`Loaded ${S.allFiles.length} file(s) (Safari mode) — set the absolute folder path in the header bar to enable rename/move/copy/delete`, 'warn');
+});
 
 async function doOpenDirectory() {
   S.depth = parseInt(document.getElementById('depthInp').value, 10) || 3;
@@ -1895,6 +2064,18 @@ function getSelFiles() { return S.allFiles.filter(f => S.selected.has(f.path)); 
 async function copyFiles() {
   const files = getSelFiles().filter(f => !f.isDir);
   if (!files.length) { toast('Select files to copy (folders not supported)', 'warn'); return; }
+
+  // Safari has no directory picker to choose a destination with, so the
+  // absolute destination folder is typed directly; server.py validates it
+  // exists before copying anything.
+  if (S.readOnly) {
+    if (!requireRootAbsPath()) return;
+    const destDir = prompt('Absolute destination folder path:');
+    if (!destDir) return;
+    await _doCopySafari(files, destDir.trim());
+    return;
+  }
+
   let dest;
   try { dest = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' }); }
   catch (e) { if (e.name !== 'AbortError') toast('Could not open destination', 'error'); return; }
@@ -1918,6 +2099,15 @@ async function copyFiles() {
 async function moveFiles() {
   const files = getSelFiles().filter(f => !f.isDir);
   if (!files.length) { toast('Select files to move (folders not supported)', 'warn'); return; }
+
+  if (S.readOnly) {
+    if (!requireRootAbsPath()) return;
+    const destDir = prompt('Absolute destination folder path:');
+    if (!destDir) return;
+    await _doMoveSafari(files, destDir.trim());
+    return;
+  }
+
   let dest;
   try { dest = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' }); }
   catch (e) { if (e.name !== 'AbortError') toast('Could not open destination', 'error'); return; }
@@ -1932,6 +2122,7 @@ async function moveFiles() {
       await wr.write(fo); await wr.close();
       await files[i].parentHandle.removeEntry(files[i].name);
       S.selected.delete(files[i].path);
+      logAction('move', `${files[i].path} -> ${dest.name}/${files[i].name}`);
       ok++;
     } catch (e) { fail++; console.error(e); }
     setProg(Math.round((i + 1) / files.length * 100));
@@ -1980,6 +2171,11 @@ async function _doRename(f, newName) {
     toast('Name can’t contain “/”, “:” or control characters. File NOT renamed.', 'error');
     return;
   }
+
+  // Safari read-only fallback: no writable handle exists locally, so the
+  // rename has to happen server-side (root-scoped — see server.py).
+  if (S.readOnly) { await _doRenameSafari(f, newName); return; }
+
   // Refuse to overwrite an existing different file
   try {
     await f.parentHandle.getFileHandle(newName);          // resolves = it exists
@@ -2006,6 +2202,7 @@ async function _doRename(f, newName) {
 
     // --- 4. Safe to remove the original now ---
     await f.parentHandle.removeEntry(f.name);
+    logAction('rename', `${f.path} -> ${f.folder}/${newName}`);
 
     // Transfer any computed hash to the new path so it survives the rename.
     const newPath = f.folder + '/' + newName;
@@ -2102,6 +2299,38 @@ const IMG_MIME   = {
   tiff:'image/tiff', tif:'image/tiff', heic:'image/heic', heif:'image/heif',
   avif:'image/avif'
 };
+function showPrevUnsupported(content, ext, name) {
+  content.innerHTML = `
+    <div class="prev-none">
+      <span class="prev-none-ico">🖼</span>
+      <p>Cannot preview <strong>.${escH(ext)}</strong> in this browser</p>
+      <p style="margin-top:8px;font-size:12px;color:var(--txt-4)">${escH(name)}</p>
+    </div>`;
+}
+
+// heic2any (CDN, loaded lazily on first HEIC/HEIF preview) decodes HEIC via
+// WASM libheif and re-encodes to JPEG client-side, since only Safari's
+// ImageIO decodes HEIC natively in <img> — Chrome/Edge/Brave cannot.
+let _heic2anyLoad = null;
+function loadHeic2any() {
+  if (window.heic2any) return Promise.resolve();
+  if (_heic2anyLoad) return _heic2anyLoad;
+  _heic2anyLoad = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js';
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('Failed to load heic2any from CDN'));
+    document.head.appendChild(s);
+  });
+  return _heic2anyLoad;
+}
+
+async function convertHeicToJpeg(heicBlob) {
+  await loadHeic2any();
+  const jpegBlob = await window.heic2any({ blob: heicBlob, toType: 'image/jpeg', quality: 0.9 });
+  return URL.createObjectURL(Array.isArray(jpegBlob) ? jpegBlob[0] : jpegBlob);
+}
+
 const PREV_VID   = ['mp4','mov','webm','m4v','ogv'];
 const PREV_AUD   = ['mp3','wav','flac','aac','ogg','m4a','opus','aiff','aif'];
 const PREV_TEXT  = ['txt','md','markdown','csv','tsv','log','json','xml','yaml','yml','toml',
@@ -2680,7 +2909,7 @@ async function previewFile(f) {
     <span class="prev-meta-v wrap">${escH(f.path)}</span>`;
 
   try {
-    const fo  = await f.handle.getFile();
+    const fo  = await getFileObj(f);
     const ext = (f.ext || '').toLowerCase();
 
     if (PREV_IMG.includes(ext)) {
@@ -2691,13 +2920,30 @@ async function previewFile(f) {
       const img = document.createElement('img');
       img.className = 'prev-img';
       img.alt = f.name;
-      img.onerror = () => {
-        content.innerHTML = `
-          <div class="prev-none">
-            <span class="prev-none-ico">🖼</span>
-            <p>Cannot preview <strong>.${escH(ext)}</strong> in this browser</p>
-            <p style="margin-top:8px;font-size:12px;color:var(--txt-4)">${escH(f.name)}</p>
-          </div>`;
+      img.onerror = async () => {
+        // Native <img> decoding of HEIC/HEIF fails on Chrome/Edge/Brave (only
+        // Safari's ImageIO decodes it natively). Fall back to converting the
+        // file to a JPEG blob in-browser via heic2any before giving up.
+        if ((ext === 'heic' || ext === 'heif') && !img.dataset.heicRetried) {
+          img.dataset.heicRetried = '1';
+          content.innerHTML = '<div style="color:var(--txt-4);font-size:13px">Converting HEIC…</div>';
+          try {
+            const jpegUrl = await convertHeicToJpeg(blob);
+            _prevUrl = jpegUrl;
+            content.innerHTML = '';
+            const img2 = document.createElement('img');
+            img2.className = 'prev-img';
+            img2.alt = f.name;
+            img2.src = jpegUrl;
+            img2.onerror = () => showPrevUnsupported(content, ext, f.name);
+            content.appendChild(img2);
+          } catch (err) {
+            console.error('HEIC conversion failed:', err);
+            showPrevUnsupported(content, ext, f.name);
+          }
+          return;
+        }
+        showPrevUnsupported(content, ext, f.name);
       };
       content.innerHTML = '';
       content.appendChild(img);
@@ -2926,7 +3172,7 @@ async function hashFile(path) {
   S.hashes.set(path, { status: 'computing' });
   updateHashCell(path);
   try {
-    const fo  = await f.handle.getFile();
+    const fo  = await getFileObj(f);
     const buf = await fo.arrayBuffer();
     let value;
     if (S.hashAlgo === 'MD5') {
@@ -3028,6 +3274,8 @@ async function confirmDelete() {
   closeModal('modalDelete');
   if (!_pendingDel) return;
   const files = _pendingDel; _pendingDel = null;
+
+  if (S.readOnly) { await _doDeleteSafari(files.filter(f => !f.isDir)); return; }
 
   if (!S.rootHandle) {
     toast('No directory open — open a folder first.', 'warn');
@@ -3334,8 +3582,10 @@ renderHead();
 if (!('showDirectoryPicker' in window)) {
   document.getElementById('apiWarn').style.display = 'block';
   document.getElementById('apiWarn').textContent =
-    '⚠️ Your browser does not support the File System Access API. ' +
-    'Please open this file in Google Chrome, Microsoft Edge, or Brave.';
+    '⚠️ Your browser (likely Safari) can\'t grant this page writable file access directly. ' +
+    'Click "Open Directory" — rename/move/copy/delete will be sent to the local FileVault ' +
+    'server (server.py) instead. Requires server.py running and the folder\'s absolute path ' +
+    'set in the header bar.';
 } else {
   tryRestoreLastDir();
 }
