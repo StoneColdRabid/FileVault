@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import json
 import os
+import plistlib
 import shutil
 import stat
 import struct
@@ -82,6 +83,59 @@ def set_xattr(path, name, value):
 def assert_xattr(test, path, name, value):
     if hasattr(os, 'getxattr'):
         test.assertEqual(os.getxattr(path, name), value)
+
+
+# Finder stores a tag as a binary plist on this attribute. The value is a
+# list of strings, each a tag name, a newline, and a color number (6 is Red).
+# A Finder comment is a binary plist string on the second attribute. Both are
+# ordinary extended attributes; stock macOS can read and write them with
+# /usr/bin/xattr. CPython on macOS does not ship os.setxattr, so the test
+# cannot use the os module for this.
+FINDER_TAG_ATTR = 'com.apple.metadata:_kMDItemUserTags'
+FINDER_COMMENT_ATTR = 'com.apple.metadata:kMDItemFinderComment'
+
+
+def xattr_set(path, name, value):
+    """Write one extended attribute with the macOS xattr command."""
+    proc = subprocess.run(
+        ['/usr/bin/xattr', '-wx', name, value.hex(), str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise OSError(detail or f'xattr -wx exited {proc.returncode}')
+
+
+def xattr_get(path, name):
+    """Return an attribute's bytes, or None when it is not set.
+
+    `xattr -px` prints hexadecimal. Missing attributes are a copy failure,
+    not a reason to skip the test.
+    """
+    proc = subprocess.run(
+        ['/usr/bin/xattr', '-px', name, str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        missing = (
+            'No such xattr' in detail
+            or 'Attribute not found' in detail
+            or 'Errno 93' in detail
+        )
+        if missing:
+            return None
+        raise OSError(detail or f'xattr -px exited {proc.returncode}')
+    hex_chars = ''.join(ch for ch in proc.stdout if ch in '0123456789abcdefABCDEF')
+    if not hex_chars:
+        return b''
+    if len(hex_chars) % 2:
+        raise ValueError(f'xattr -px returned odd-length hex: {proc.stdout!r}')
+    return bytes.fromhex(hex_chars)
 
 
 class ServerTestCase(unittest.TestCase):
@@ -381,6 +435,60 @@ class FileOperationTests(unittest.TestCase):
         self.assertFalse(into['ok'])
         after = sorted(p.relative_to(folder).as_posix() for p in folder.rglob('*'))
         self.assertEqual(before, after)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Finder tags are macOS extended attributes')
+    def test_macos_copy_keeps_finder_tags_on_file_and_folder(self):
+        """A helper copy must keep a real Finder tag, including inside a folder.
+
+        The tag is the binary plist Finder writes on
+        com.apple.metadata:_kMDItemUserTags. The comment is the plist Finder
+        writes on com.apple.metadata:kMDItemFinderComment. Both are set with
+        /usr/bin/xattr, then copied through write_copy (the /api/write/copy path).
+        """
+        tag = plistlib.dumps(['Red\n6'], fmt=plistlib.FMT_BINARY)
+        comment = plistlib.dumps('Quarterly receipt', fmt=plistlib.FMT_BINARY)
+        src = self.root / 'tagged.txt'
+        src.write_bytes(b'tagged-bytes')
+        xattr_set(src, FINDER_TAG_ATTR, tag)
+        xattr_set(src, FINDER_COMMENT_ATTR, comment)
+        stored_tag = xattr_get(src, FINDER_TAG_ATTR)
+        stored_comment = xattr_get(src, FINDER_COMMENT_ATTR)
+        self.assertIsNotNone(stored_tag, 'Finder tag was not stored on the source')
+        self.assertEqual(plistlib.loads(stored_tag), ['Red\n6'])
+        self.assertEqual(plistlib.loads(stored_comment), 'Quarterly receipt')
+
+        dest = self.root / 'dest'
+        dest.mkdir()
+        result = server.write_copy(str(self.root), str(src), str(dest))
+        self.assertTrue(result['ok'], result)
+        copied = Path(result['path'])
+        self.assertEqual(copied.read_bytes(), b'tagged-bytes')
+        self.assertNotEqual(src.stat().st_ino, copied.stat().st_ino)
+        with self.subTest('file tag'):
+            self.assertEqual(xattr_get(copied, FINDER_TAG_ATTR), stored_tag)
+        with self.subTest('finder comment'):
+            self.assertEqual(xattr_get(copied, FINDER_COMMENT_ATTR), stored_comment)
+
+        folder = self.root / 'tagged-dir'
+        folder.mkdir()
+        inner = folder / 'inner.txt'
+        inner.write_text('inside')
+        xattr_set(inner, FINDER_TAG_ATTR, tag)
+        xattr_set(folder, FINDER_TAG_ATTR, tag)
+        inner_tag = xattr_get(inner, FINDER_TAG_ATTR)
+        folder_tag = xattr_get(folder, FINDER_TAG_ATTR)
+        self.assertEqual(plistlib.loads(inner_tag), ['Red\n6'])
+        self.assertEqual(plistlib.loads(folder_tag), ['Red\n6'])
+        folder_dest = self.root / 'folder-dest'
+        folder_dest.mkdir()
+        folder_result = server.write_copy(str(self.root), str(folder), str(folder_dest))
+        self.assertTrue(folder_result['ok'], folder_result)
+        copied_folder = Path(folder_result['path'])
+        self.assertEqual((copied_folder / 'inner.txt').read_text(), 'inside')
+        with self.subTest('tagged file inside a copied folder'):
+            self.assertEqual(xattr_get(copied_folder / 'inner.txt', FINDER_TAG_ATTR), inner_tag)
+        with self.subTest('tag on the copied folder'):
+            self.assertEqual(xattr_get(copied_folder, FINDER_TAG_ATTR), folder_tag)
 
     def test_move_same_folder_does_not_delete_or_rename(self):
         src = self.root / 'keep.txt'
