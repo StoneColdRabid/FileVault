@@ -68,6 +68,22 @@ def listening_v4(port):
     return found
 
 
+def set_xattr(path, name, value):
+    """Set an extended attribute when this Python can.
+
+    CPython's os.setxattr is Linux-only. macOS builds do not provide it
+    (support is still an unmerged CPython change), so the metadata checks
+    below are skipped there and the rest of the test still runs.
+    """
+    if hasattr(os, 'setxattr'):
+        os.setxattr(path, name, value)
+
+
+def assert_xattr(test, path, name, value):
+    if hasattr(os, 'getxattr'):
+        test.assertEqual(os.getxattr(path, name), value)
+
+
 class ServerTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -312,7 +328,7 @@ class FileOperationTests(unittest.TestCase):
         src.write_bytes(b'source-bytes')
         os.chmod(src, 0o640)
         os.utime(src, (1_700_000_000, 1_700_000_000))
-        os.setxattr(src, 'user.test', b'tag')
+        set_xattr(src, 'user.test', b'tag')
         dest_dir = self.root / 'dest'
         dest_dir.mkdir()
         existing = dest_dir / 'a.txt'
@@ -332,7 +348,7 @@ class FileOperationTests(unittest.TestCase):
         self.assertNotEqual(src.stat().st_ino, copied.stat().st_ino)
         self.assertEqual(src.stat().st_mtime, copied.stat().st_mtime)
         self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o640)
-        self.assertEqual(os.getxattr(copied, 'user.test'), b'tag')
+        assert_xattr(self, copied, 'user.test', b'tag')
         self.assertTrue(src.exists())
 
     def test_copy_same_folder_does_not_truncate_the_file(self):
@@ -369,21 +385,21 @@ class FileOperationTests(unittest.TestCase):
     def test_move_same_folder_does_not_delete_or_rename(self):
         src = self.root / 'keep.txt'
         src.write_text('keepme')
-        os.setxattr(src, 'user.tag', b'blue')
+        set_xattr(src, 'user.tag', b'blue')
         ino = src.stat().st_ino
         result = server.write_move(str(self.root), str(src), str(self.root))
         self.assertFalse(result['ok'])
         self.assertTrue(src.exists())
         self.assertEqual(src.read_text(), 'keepme')
         self.assertEqual(src.stat().st_ino, ino)
-        self.assertEqual(os.getxattr(src, 'user.tag'), b'blue')
+        assert_xattr(self, src, 'user.tag', b'blue')
         self.assertFalse(list(self.root.glob('keep (*).txt')))
 
     def test_move_refuses_existing_name_and_preserves_metadata(self):
         src = self.root / 'move-me.txt'
         src.write_text('payload')
         os.utime(src, (1_700_000_000, 1_711_111_111))
-        os.setxattr(src, 'user.tag', b'green')
+        set_xattr(src, 'user.tag', b'green')
         dest = self.root / 'dest'
         dest.mkdir()
         (dest / 'move-me.txt').write_text('already')
@@ -401,7 +417,7 @@ class FileOperationTests(unittest.TestCase):
         self.assertEqual(target.read_text(), 'payload')
         self.assertEqual(target.stat().st_ino, ino)
         self.assertEqual(target.stat().st_mtime, 1_711_111_111)
-        self.assertEqual(os.getxattr(target, 'user.tag'), b'green')
+        assert_xattr(self, target, 'user.tag', b'green')
 
     def test_move_folder_into_itself_is_refused(self):
         folder = self.root / 'tree'
@@ -416,7 +432,7 @@ class FileOperationTests(unittest.TestCase):
     def test_rename_preserves_inode_xattrs_and_refuses_collisions(self):
         src = self.root / 'old.txt'
         src.write_text('body')
-        os.setxattr(src, 'user.tag', b'red')
+        set_xattr(src, 'user.tag', b'red')
         other = self.root / 'taken.txt'
         other.write_text('taken')
         ino = src.stat().st_ino
@@ -429,7 +445,7 @@ class FileOperationTests(unittest.TestCase):
         self.assertTrue(renamed['ok'], renamed)
         target = Path(renamed['path'])
         self.assertEqual(target.stat().st_ino, ino)
-        self.assertEqual(os.getxattr(target, 'user.tag'), b'red')
+        assert_xattr(self, target, 'user.tag', b'red')
         self.assertFalse(src.exists())
 
     def test_rename_rejects_path_separators_and_overlong_names(self):
@@ -445,7 +461,7 @@ class FileOperationTests(unittest.TestCase):
         # A few megabytes is enough to show this is a rename: the inode is kept
         # and the operation does not depend on loading the bytes in Python.
         big.write_bytes(b'x' * (3 * 1024 * 1024))
-        os.setxattr(big, 'user.tag', b'keep')
+        set_xattr(big, 'user.tag', b'keep')
         ino = big.stat().st_ino
         result = server.trash_items(
             str(self.root),
@@ -457,7 +473,7 @@ class FileOperationTests(unittest.TestCase):
         trashed = Path(result['trashedPath'])
         self.assertEqual(trashed.stat().st_ino, ino)
         self.assertEqual(trashed.stat().st_size, 3 * 1024 * 1024)
-        self.assertEqual(os.getxattr(trashed, 'user.tag'), b'keep')
+        assert_xattr(self, trashed, 'user.tag', b'keep')
 
         folder = self.root / 'box'
         folder.mkdir()
@@ -612,12 +628,13 @@ def _delete_trash_named(token):
             shutil.rmtree(child, ignore_errors=True)
 
 
-def _put_back_blob(filename):
-    """Return the ~/.Trash/.DS_Store `ptbL` blob for filename, if recorded.
+def _put_back_location(filename):
+    """Return the original folder Finder recorded for a Trash filename.
 
-    Finder's Put Back reads this bookmark of the original folder. A plain
-    rename into ~/.Trash does not write it. The record is not a public API;
-    callers that cannot see it should say so instead of assuming Put Back.
+    `trashItemAtURL` writes a `ptbL` record into ~/.Trash/.DS_Store. On
+    current macOS that value is a `ustr` (UTF-16-BE path of the original
+    folder). Older stores may use a `blob` bookmark; those bytes are
+    returned unchanged. A plain rename into ~/.Trash does not write `ptbL`.
     """
     ds_path = _user_trash() / '.DS_Store'
     if not ds_path.is_file():
@@ -629,15 +646,22 @@ def _put_back_blob(filename):
     if idx < 0:
         return None
     type_at = idx + len(marker)
-    if data[type_at:type_at + 4] != b'blob':
-        return None
     if type_at + 8 > len(data):
         return None
+    dtype = data[type_at:type_at + 4]
     length = struct.unpack('>I', data[type_at + 4:type_at + 8])[0]
-    end = type_at + 8 + length
-    if length > 1_000_000 or end > len(data):
-        return None
-    return data[type_at + 8:end]
+    if dtype == b'ustr':
+        nbytes = length * 2
+        end = type_at + 8 + nbytes
+        if length > 100_000 or end > len(data):
+            return None
+        return data[type_at + 8:end].decode('utf-16-be')
+    if dtype == b'blob':
+        end = type_at + 8 + length
+        if length > 1_000_000 or end > len(data):
+            return None
+        return data[type_at + 8:end]
+    return None
 
 
 def _put_back_diagnostic(filename):
@@ -696,14 +720,17 @@ class MacTrashTests(unittest.TestCase):
             trashed = _find_in_user_trash(token, payload)
             self.assertIsNotNone(trashed, f'{token} is not in {_user_trash()}')
             self.assertEqual(trashed.read_bytes(), payload)
-            # Put Back is a Finder action. What a script can see is the
-            # ptbL bookmark trashItemAtURL writes into ~/.Trash/.DS_Store.
-            blob = _put_back_blob(trashed.name)
+            # Put Back itself is a Finder menu. The script-visible record is
+            # the original folder path in ~/.Trash/.DS_Store (ptbL / ustr).
+            location = _put_back_location(trashed.name)
             self.assertIsNotNone(
-                blob,
+                location,
                 'no Put Back record for the trashed name; ' + _put_back_diagnostic(trashed.name),
             )
-            self.assertIn(token.encode(), blob, 'Put Back bookmark does not name the original folder')
+            if isinstance(location, str):
+                self.assertEqual(Path(location).resolve(), folder.resolve())
+            else:
+                self.assertIn(token.encode(), location)
         finally:
             _delete_trash_named(token)
             shutil.rmtree(folder, ignore_errors=True)
