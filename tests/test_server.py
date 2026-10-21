@@ -3,10 +3,12 @@
 These exercise the real server: loopback binding, per-launch token, origin
 and Host checks, and copy/move/rename/trash behavior on throwaway files.
 """
+import errno
 import hashlib
 import http.client
 import json
 import os
+import plistlib
 import shutil
 import stat
 import struct
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import uuid
 from pathlib import Path
 
@@ -69,19 +72,126 @@ def listening_v4(port):
 
 
 def set_xattr(path, name, value):
-    """Set an extended attribute when this Python can.
+    """Set an extended attribute.
 
-    CPython's os.setxattr is Linux-only. macOS builds do not provide it
-    (support is still an unmerged CPython change), so the metadata checks
-    below are skipped there and the rest of the test still runs.
+    Linux CPython has os.setxattr. macOS CPython does not, so those checks
+    use /usr/bin/xattr. A failure fails the test; it is not skipped.
     """
     if hasattr(os, 'setxattr'):
         os.setxattr(path, name, value)
+        return
+    if sys.platform == 'darwin':
+        xattr_set(path, name, value)
 
 
 def assert_xattr(test, path, name, value):
     if hasattr(os, 'getxattr'):
         test.assertEqual(os.getxattr(path, name), value)
+        return
+    if sys.platform == 'darwin':
+        test.assertEqual(xattr_get(path, name), value)
+
+
+# Finder stores a tag as a binary plist on this attribute. The value is a
+# list of strings, each a tag name, a newline, and a color number (6 is Red).
+# A Finder comment is a binary plist string on the second attribute. Both are
+# ordinary extended attributes; stock macOS can read and write them with
+# /usr/bin/xattr. CPython on macOS does not ship os.setxattr, so the test
+# cannot use the os module for this.
+FINDER_TAG_ATTR = 'com.apple.metadata:_kMDItemUserTags'
+FINDER_COMMENT_ATTR = 'com.apple.metadata:kMDItemFinderComment'
+
+
+def xattr_set(path, name, value):
+    """Write one extended attribute with the macOS xattr command."""
+    proc = subprocess.run(
+        ['/usr/bin/xattr', '-wx', name, value.hex(), str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise OSError(detail or f'xattr -wx exited {proc.returncode}')
+
+
+def xattr_get(path, name):
+    """Return an attribute's bytes, or None when it is not set.
+
+    `xattr -px` prints hexadecimal. Missing attributes are a copy failure,
+    not a reason to skip the test.
+    """
+    proc = subprocess.run(
+        ['/usr/bin/xattr', '-px', name, str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        missing = (
+            'No such xattr' in detail
+            or 'Attribute not found' in detail
+            or 'Errno 93' in detail
+        )
+        if missing:
+            return None
+        raise OSError(detail or f'xattr -px exited {proc.returncode}')
+    hex_chars = ''.join(ch for ch in proc.stdout if ch in '0123456789abcdefABCDEF')
+    if not hex_chars:
+        return b''
+    if len(hex_chars) % 2:
+        raise ValueError(f'xattr -px returned odd-length hex: {proc.stdout!r}')
+    return bytes.fromhex(hex_chars)
+
+
+def set_birthtime_ns(path, birth_ns):
+    """Set the creation time of a file or folder. macOS only."""
+    import ctypes
+
+    class AttrList(ctypes.Structure):
+        _fields_ = [
+            ('bitmapcount', ctypes.c_ushort),
+            ('reserved', ctypes.c_uint16),
+            ('commonattr', ctypes.c_uint32),
+            ('volattr', ctypes.c_uint32),
+            ('dirattr', ctypes.c_uint32),
+            ('fileattr', ctypes.c_uint32),
+            ('forkattr', ctypes.c_uint32),
+        ]
+
+    class TimeSpec(ctypes.Structure):
+        _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+
+    sec, nsec = divmod(int(birth_ns), 1_000_000_000)
+    lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    lib.setattrlist.argtypes = [
+        ctypes.c_char_p, ctypes.POINTER(AttrList), ctypes.c_void_p,
+        ctypes.c_size_t, ctypes.c_ulong,
+    ]
+    lib.setattrlist.restype = ctypes.c_int
+    attrs = AttrList()
+    attrs.bitmapcount = 5
+    attrs.commonattr = 0x00000200  # ATTR_CMN_CRTIME
+    spec = TimeSpec(sec, nsec)
+    result = lib.setattrlist(
+        os.fsencode(path), ctypes.byref(attrs), ctypes.byref(spec),
+        ctypes.sizeof(spec), 1,
+    )
+    if result != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err) or 'setattrlist failed', str(path))
+
+
+def birthtime_ns(path):
+    """Creation time in nanoseconds.
+
+    The macOS CPython build in CI exposes st_birthtime and not st_birthtime_ns.
+    """
+    st = os.lstat(path)
+    if hasattr(st, 'st_birthtime_ns'):
+        return st.st_birthtime_ns
+    return int(round(st.st_birthtime * 1_000_000_000))
 
 
 class ServerTestCase(unittest.TestCase):
@@ -381,6 +491,124 @@ class FileOperationTests(unittest.TestCase):
         self.assertFalse(into['ok'])
         after = sorted(p.relative_to(folder).as_posix() for p in folder.rglob('*'))
         self.assertEqual(before, after)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Finder tags are macOS extended attributes')
+    def test_macos_copy_keeps_finder_tags_on_file_and_folder(self):
+        """A helper copy must keep a real Finder tag, including inside a folder.
+
+        The tag is the binary plist Finder writes on
+        com.apple.metadata:_kMDItemUserTags. The comment is the plist Finder
+        writes on com.apple.metadata:kMDItemFinderComment. Both are set with
+        /usr/bin/xattr, then copied through write_copy (the /api/write/copy path).
+        Creation time is set to a fixed past instant so it cannot match by chance.
+        """
+        tag = plistlib.dumps(['Red\n6'], fmt=plistlib.FMT_BINARY)
+        comment = plistlib.dumps('Quarterly receipt', fmt=plistlib.FMT_BINARY)
+        src = self.root / 'tagged.txt'
+        src.write_bytes(b'tagged-bytes')
+        xattr_set(src, FINDER_TAG_ATTR, tag)
+        xattr_set(src, FINDER_COMMENT_ATTR, comment)
+        # Whole seconds stay exact in st_birthtime, which is a float on macOS.
+        # Set the creation time after mtime so a later utime cannot clear it.
+        os.utime(src, ns=(1_700_000_000_000_000_000, 1_700_000_100_000_000_000))
+        set_birthtime_ns(src, 1_000_000_000 * 1_000_000_000)
+        stored_tag = xattr_get(src, FINDER_TAG_ATTR)
+        stored_comment = xattr_get(src, FINDER_COMMENT_ATTR)
+        self.assertIsNotNone(stored_tag, 'Finder tag was not stored on the source')
+        self.assertEqual(plistlib.loads(stored_tag), ['Red\n6'])
+        self.assertEqual(plistlib.loads(stored_comment), 'Quarterly receipt')
+        self.assertEqual(birthtime_ns(src) // 1_000_000_000, 1_000_000_000)
+        self.assertEqual(src.stat().st_mtime_ns, 1_700_000_100_000_000_000)
+
+        dest = self.root / 'dest'
+        dest.mkdir()
+        result = server.write_copy(str(self.root), str(src), str(dest))
+        self.assertTrue(result['ok'], result)
+        copied = Path(result['path'])
+        self.assertEqual(copied.read_bytes(), b'tagged-bytes')
+        self.assertNotEqual(src.stat().st_ino, copied.stat().st_ino)
+        with self.subTest('file tag'):
+            self.assertEqual(xattr_get(copied, FINDER_TAG_ATTR), stored_tag)
+        with self.subTest('finder comment'):
+            self.assertEqual(xattr_get(copied, FINDER_COMMENT_ATTR), stored_comment)
+        with self.subTest('file creation time'):
+            self.assertEqual(birthtime_ns(copied), birthtime_ns(src))
+        self.assertEqual(copied.stat().st_mtime_ns, src.stat().st_mtime_ns)
+
+        folder = self.root / 'tagged-dir'
+        folder.mkdir()
+        inner = folder / 'inner.txt'
+        inner.write_text('inside')
+        xattr_set(inner, FINDER_TAG_ATTR, tag)
+        xattr_set(folder, FINDER_TAG_ATTR, tag)
+        os.utime(inner, ns=(1_600_000_000_000_000_000, 1_600_000_060_000_000_000))
+        os.utime(folder, ns=(1_600_000_000_000_000_000, 1_600_000_050_000_000_000))
+        set_birthtime_ns(inner, 1_000_000_001 * 1_000_000_000)
+        set_birthtime_ns(folder, 1_000_000_002 * 1_000_000_000)
+        inner_tag = xattr_get(inner, FINDER_TAG_ATTR)
+        folder_tag = xattr_get(folder, FINDER_TAG_ATTR)
+        self.assertEqual(plistlib.loads(inner_tag), ['Red\n6'])
+        self.assertEqual(plistlib.loads(folder_tag), ['Red\n6'])
+        folder_dest = self.root / 'folder-dest'
+        folder_dest.mkdir()
+        folder_result = server.write_copy(str(self.root), str(folder), str(folder_dest))
+        self.assertTrue(folder_result['ok'], folder_result)
+        copied_folder = Path(folder_result['path'])
+        copied_inner = copied_folder / 'inner.txt'
+        self.assertEqual(copied_inner.read_text(), 'inside')
+        with self.subTest('tagged file inside a copied folder'):
+            self.assertEqual(xattr_get(copied_inner, FINDER_TAG_ATTR), inner_tag)
+        with self.subTest('tag on the copied folder'):
+            self.assertEqual(xattr_get(copied_folder, FINDER_TAG_ATTR), folder_tag)
+        with self.subTest('creation time inside a copied folder'):
+            self.assertEqual(birthtime_ns(copied_inner), birthtime_ns(inner))
+        with self.subTest('creation time of the copied folder'):
+            self.assertEqual(birthtime_ns(copied_folder), birthtime_ns(folder))
+        self.assertEqual(copied_inner.stat().st_mtime_ns, inner.stat().st_mtime_ns)
+        self.assertEqual(copied_folder.stat().st_mtime_ns, folder.stat().st_mtime_ns)
+
+    def test_copyfile_eexist_leaves_the_destination_that_won_the_race(self):
+        """COPYFILE_EXCL lost the race: do not delete the file that appeared.
+
+        copy_path sees no destination, then copyfile fails with EEXIST because
+        that name was created in between. The loser must leave the winner alone.
+        """
+        src_file = self.root / 'src.txt'
+        src_file.write_text('source')
+        src_dir = self.root / 'srcdir'
+        src_dir.mkdir()
+        (src_dir / 'child.txt').write_text('child')
+
+        def occupy_then_eexist(kind):
+            def race(_src, dst, _flags):
+                target = Path(dst)
+                if kind == 'folder':
+                    target.mkdir()
+                    (target / 'kept.txt').write_text('preexisting')
+                else:
+                    target.write_text('preexisting')
+                raise OSError(errno.EEXIST, os.strerror(errno.EEXIST))
+            return race
+
+        cases = (
+            ('file', src_file, self.root / 'raced.txt'),
+            ('folder', src_dir, self.root / 'raced-dir'),
+        )
+        for kind, src, dst in cases:
+            with self.subTest(kind):
+                with unittest.mock.patch.object(server.sys, 'platform', 'darwin'), \
+                     unittest.mock.patch.object(
+                         server, '_darwin_copyfile', side_effect=occupy_then_eexist(kind),
+                     ):
+                    with self.assertRaises(OSError) as caught:
+                        server.copy_path(src, dst)
+                self.assertEqual(caught.exception.errno, errno.EEXIST)
+                self.assertTrue(dst.exists(), 'existing destination was removed')
+                if kind == 'folder':
+                    self.assertEqual((dst / 'kept.txt').read_text(), 'preexisting')
+                else:
+                    self.assertEqual(dst.read_text(), 'preexisting')
+                self.assertTrue(src.exists())
 
     def test_move_same_folder_does_not_delete_or_rename(self):
         src = self.root / 'keep.txt'

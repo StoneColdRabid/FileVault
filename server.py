@@ -22,6 +22,9 @@ File tools (used by Safari/Firefox, and by Trash from every browser):
 Rename and same-volume move use os.rename, so timestamps and extended
 attributes stay with the file. Copy checks SHA-256, not just size, and
 refuses when the destination name already exists. Nothing is overwritten.
+On macOS the copy uses copyfile(3), which keeps extended attributes
+(Finder tags and comments included) and the creation time. Elsewhere the
+copy uses shutil.copy2.
 
 On macOS, Trash goes through NSFileManager.trashItemAtURL (via osascript)
 so Finder's Put Back still works. That call reads no file bytes. If it
@@ -222,12 +225,166 @@ def _bytes_match(src, dst):
     return stream_hash(src) == stream_hash(dst)
 
 
+# copyfile(3) flags from <copyfile.h>. CPython on macOS does not provide
+# os.listxattr, so shutil.copy2 leaves Finder tags behind. copyfile is what
+# /bin/cp uses to copy data and metadata together.
+_COPYFILE_METADATA = (1 << 1) | (1 << 0) | (1 << 2)  # STAT | ACL | XATTR
+_COPYFILE_ALL = _COPYFILE_METADATA | (1 << 3)  # plus DATA
+_COPYFILE_EXCL = 1 << 17
+_COPYFILE_NOFOLLOW = (1 << 18) | (1 << 19)
+_DARWIN_FILE_FLAGS = _COPYFILE_ALL | _COPYFILE_EXCL | _COPYFILE_NOFOLLOW
+_DARWIN_DIR_FLAGS = _COPYFILE_METADATA | _COPYFILE_EXCL | _COPYFILE_NOFOLLOW
+_ATTR_BIT_MAP_COUNT = 5
+_ATTR_CMN_CRTIME = 0x00000200
+_ATTR_CMN_MODTIME = 0x00000400
+_ATTR_CMN_ACCTIME = 0x00001000
+_FSOPT_NOFOLLOW = 0x00000001
+
+_darwin_lib = None
+
+
+def _load_darwin_lib():
+    """libc with copyfile(3) and setattrlist prototypes set once."""
+    global _darwin_lib
+    if _darwin_lib is not None:
+        return _darwin_lib
+    import ctypes
+
+    class AttrList(ctypes.Structure):
+        _fields_ = [
+            ('bitmapcount', ctypes.c_ushort),
+            ('reserved', ctypes.c_uint16),
+            ('commonattr', ctypes.c_uint32),
+            ('volattr', ctypes.c_uint32),
+            ('dirattr', ctypes.c_uint32),
+            ('fileattr', ctypes.c_uint32),
+            ('forkattr', ctypes.c_uint32),
+        ]
+
+    class TimeSpec(ctypes.Structure):
+        _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+
+    class TimeBuf(ctypes.Structure):
+        # setattrlist writes values in ascending attribute-bit order.
+        _fields_ = [('cr', TimeSpec), ('mod', TimeSpec), ('acc', TimeSpec)]
+
+    lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    lib.copyfile.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32,
+    ]
+    lib.copyfile.restype = ctypes.c_int
+    lib.setattrlist.argtypes = [
+        ctypes.c_char_p, ctypes.POINTER(AttrList), ctypes.c_void_p,
+        ctypes.c_size_t, ctypes.c_ulong,
+    ]
+    lib.setattrlist.restype = ctypes.c_int
+    lib.AttrList = AttrList
+    lib.TimeSpec = TimeSpec
+    lib.TimeBuf = TimeBuf
+    _darwin_lib = lib
+    return lib
+
+
+def _split_ns(ns):
+    sec, nsec = divmod(int(ns), 1_000_000_000)
+    if nsec < 0:
+        sec -= 1
+        nsec += 1_000_000_000
+    return sec, nsec
+
+
+def _darwin_copyfile(src, dst, flags):
+    import ctypes
+    lib = _load_darwin_lib()
+    result = lib.copyfile(os.fsencode(src), os.fsencode(dst), None, flags)
+    if result == 0:
+        return
+    err = ctypes.get_errno()
+    message = os.strerror(err) if err else 'copyfile failed'
+    raise OSError(err, message, str(src), None, str(dst))
+
+
+def _timestamp_ns(st, name):
+    """Nanoseconds for st_mtime, st_atime, or st_birthtime.
+
+    CPython 3.14 on macOS has st_birthtime and not st_birthtime_ns.
+    """
+    if hasattr(st, name + '_ns'):
+        return getattr(st, name + '_ns')
+    seconds = getattr(st, name, None)
+    if seconds is None:
+        return None
+    return int(round(seconds * 1_000_000_000))
+
+
+def _restore_darwin_times(src, dst):
+    """Copy creation, modification, and access times. Failure leaves the copy.
+
+    copyfile(3) keeps mtime but not birth time. A directory's mtime is also
+    bumped while its children are created, so both are written back here.
+    """
+    import ctypes
+    src_stat = os.lstat(src)
+    birth_ns = _timestamp_ns(src_stat, 'st_birthtime')
+    mtime_ns = _timestamp_ns(src_stat, 'st_mtime')
+    atime_ns = _timestamp_ns(src_stat, 'st_atime')
+    if mtime_ns is None or atime_ns is None:
+        return
+    if birth_ns is None:
+        try:
+            os.utime(dst, ns=(atime_ns, mtime_ns))
+        except OSError:
+            pass
+        return
+    lib = _load_darwin_lib()
+    attrs = lib.AttrList()
+    attrs.bitmapcount = _ATTR_BIT_MAP_COUNT
+    attrs.commonattr = _ATTR_CMN_CRTIME | _ATTR_CMN_MODTIME | _ATTR_CMN_ACCTIME
+    buf = lib.TimeBuf()
+
+    def timespec(ns):
+        # Nested ctypes structures are copied on read, so build a new one
+        # and assign it back onto the buffer.
+        sec, nsec = _split_ns(ns)
+        spec = lib.TimeSpec(sec, nsec)
+        return spec
+
+    buf.cr = timespec(birth_ns)
+    buf.mod = timespec(mtime_ns)
+    buf.acc = timespec(atime_ns)
+    result = lib.setattrlist(
+        os.fsencode(dst), ctypes.byref(attrs), ctypes.byref(buf),
+        ctypes.sizeof(buf), _FSOPT_NOFOLLOW,
+    )
+    if result == 0:
+        return
+    try:
+        os.utime(dst, ns=(atime_ns, mtime_ns))
+    except OSError:
+        pass
+
+
+def _remove_copy(dst):
+    if dst.is_dir() and not dst.is_symlink():
+        shutil.rmtree(dst, ignore_errors=True)
+    else:
+        dst.unlink(missing_ok=True)
+
+
+def _remove_failed_copy(dst, exc):
+    """Drop a partial copy. EEXIST means some other file already has that name."""
+    if exc.errno == errno.EEXIST:
+        return
+    _remove_copy(dst)
+
+
 def copy_path(src, dst):
     """Copy src to dst. dst must not exist. File bytes are checked with SHA-256.
 
     Symlinks are copied as symlinks and are not followed. A copy is a new
-    file: the inode and creation time change. Mode, mtime, and extended
-    attributes are kept when the platform allows it (shutil.copy2).
+    file: the inode changes. Mode, mtime, and extended attributes are kept.
+    On macOS, copyfile(3) also keeps Finder tags, Finder comments, and the
+    creation time. Other platforms use shutil.copy2.
     """
     src = Path(src)
     dst = Path(dst)
@@ -240,24 +397,42 @@ def copy_path(src, dst):
             raise OSError('symlink copy mismatch')
         return
     if src.is_dir():
-        dst.mkdir()
-        try:
-            shutil.copystat(src, dst, follow_symlinks=False)
-        except OSError:
-            pass
+        if sys.platform == 'darwin':
+            try:
+                _darwin_copyfile(src, dst, _DARWIN_DIR_FLAGS)
+            except OSError as exc:
+                _remove_failed_copy(dst, exc)
+                raise
+        else:
+            dst.mkdir()
+            try:
+                shutil.copystat(src, dst, follow_symlinks=False)
+            except OSError:
+                pass
         try:
             for child in src.iterdir():
                 copy_path(child, dst / child.name)
+            if sys.platform == 'darwin':
+                _restore_darwin_times(src, dst)
         except Exception:
             shutil.rmtree(dst, ignore_errors=True)
             raise
         return
     if not src.is_file():
         raise OSError(f'unsupported file type: {src}')
-    shutil.copy2(src, dst, follow_symlinks=False)
+    if sys.platform == 'darwin':
+        try:
+            _darwin_copyfile(src, dst, _DARWIN_FILE_FLAGS)
+        except OSError as exc:
+            _remove_failed_copy(dst, exc)
+            raise
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
     if not _bytes_match(src, dst):
         dst.unlink(missing_ok=True)
         raise OSError('copy verification failed (hash mismatch)')
+    if sys.platform == 'darwin':
+        _restore_darwin_times(src, dst)
 
 
 def move_path(src, dst):
