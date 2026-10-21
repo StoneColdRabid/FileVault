@@ -22,7 +22,12 @@ fi
 # Start the server if we don't have a live one.
 if [ -z "$URL" ]; then
     echo "Starting FileVault server..."
-    /opt/homebrew/bin/python3 "$PROJECT/server.py" &
+    PYTHON="$(command -v python3 || true)"
+    if [ -z "$PYTHON" ]; then
+        echo "ERROR: python3 was not found. Install Python 3, then try again."
+        exit 1
+    fi
+    "$PYTHON" "$PROJECT/server.py" &
 
     # Wait for server.py to write its chosen port (up to 3 s).
     PORT=""
@@ -63,5 +68,7 @@ fi
 
 echo ""
 echo "FileVault is running at $URL"
-echo "Supported browsers: Chrome, Brave, Edge (NOT Safari or Firefox)."
+echo "Full editing: Chrome, Brave, or Edge."
+echo "Safari and Firefox can browse; set the absolute folder path to rename, move, copy, or trash."
+echo "The server accepts connections from this computer only."
 echo "Close this window when you're done (the server keeps running in the background)."
