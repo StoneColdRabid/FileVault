@@ -728,7 +728,12 @@ class MacTrashTests(unittest.TestCase):
                 'no Put Back record for the trashed name; ' + _put_back_diagnostic(trashed.name),
             )
             if isinstance(location, str):
-                self.assertEqual(Path(location).resolve(), folder.resolve())
+                # The record is the original folder. Current macOS writes it
+                # without a leading slash (Users/name/...), so root it before
+                # comparing. A relative Path.resolve() would use the cwd.
+                text = location.split('\x00', 1)[0]
+                rooted = Path(text if text.startswith('/') else '/' + text)
+                self.assertEqual(rooted.resolve(), folder.resolve(), f'Put Back record was {location!r}')
             else:
                 self.assertIn(token.encode(), location)
         finally:
