@@ -1009,6 +1009,7 @@ body.panel-resizing * { cursor: ew-resize !important; user-select: none !importa
         <li>Your browser will ask for permission — click <em>Allow</em> or <em>View Files</em>.</li>
         <li>FileVault scans the directory and lists all files organized by type.</li>
         <li>Set <strong>Scan depth</strong> before opening — higher values scan more subdirectories (may be slow for large drives).</li>
+        <li>Try this on a <strong>copy</strong> of important files first. Rename, move, and delete change the real files.</li>
       </ul>
     </div>
 
@@ -1035,27 +1036,24 @@ body.panel-resizing * { cursor: ew-resize !important; user-select: none !importa
     <div class="help-sec">
       <h3>File Operations</h3>
       <ul>
-        <li><strong>Copy To…</strong> — Copy selected files to a folder you choose.</li>
-        <li><strong>Move To…</strong> — Move selected files (copy then delete originals).</li>
-        <li><strong>Rename</strong> — Rename a single selected file (one at a time).</li>
-        <li><strong>Open</strong> — Open file(s) in a new browser tab (great for images, PDFs, text).</li>
-        <li><strong>Delete</strong> — Moves selected files to macOS Trash via <code>server.py</code>. Requires the root path field in the header to be set correctly.</li>
+        <li><strong>Copy To…</strong> — Copy selected files or folders. If the name already exists, that copy is skipped. Each copied file is checked with SHA-256.</li>
+        <li><strong>Move To…</strong> — Move selected files or folders. In Chrome, Edge, and Brave this is a real rename, so dates and Finder tags stay on the same disk. An item already in that folder is left alone.</li>
+        <li><strong>Rename</strong> — Rename a single file. In Chrome, Edge, and Brave this is a real rename.</li>
+        <li><strong>Delete</strong> — Moves the selection to the Trash through <code>server.py</code>. Set the absolute folder path in the header first. The file is not loaded into the browser. On macOS, Finder’s Put Back still works.</li>
       </ul>
     </div>
 
     <div class="help-sec">
       <h3>Browser Requirements</h3>
       <ul>
-        <li>Requires the <strong>File System Access API</strong>.</li>
-        <li>Fully supported in <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong>, and <strong>Brave</strong>.</li>
-        <li>Safari on macOS Tahoe has partial support — Chrome is recommended.</li>
-        <li>Firefox does not currently support this API.</li>
+        <li>Full read and write in <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong>, and <strong>Brave</strong>.</li>
+        <li>Safari and Firefox can browse, preview, and hash. Rename, move, copy, and delete are sent to <code>server.py</code> and need the absolute folder path filled in.</li>
       </ul>
     </div>
 
     <div class="help-sec">
       <h3>Privacy</h3>
-      <p>FileVault is 100% local. No data, files, or metadata leave your machine. Everything runs in your browser with no network calls.</p>
+      <p>File operations stay on this computer. The helper listens only on localhost. Previewing a HEIC photo is the one network request: it loads heic2any from jsDelivr. Nothing you open is uploaded.</p>
     </div>
 
     <div class="modal-actions">
@@ -1072,6 +1070,9 @@ body.panel-resizing * { cursor: ew-resize !important; user-select: none !importa
 ============================================================ -->
 <script>
 'use strict';
+
+// Replaced by server.py on each launch. Other pages cannot read this.
+const FILEVAULT_TOKEN = "__FILEVAULT_TOKEN__";
 
 // ================================================================
 // HANDLE PERSISTENCE (IndexedDB)
@@ -1094,13 +1095,26 @@ const _IDB = (() => {
   };
 })();
 
+function apiHeaders(extra) {
+  const headers = { 'X-FileVault-Token': FILEVAULT_TOKEN };
+  if (extra) Object.keys(extra).forEach(key => { headers[key] = extra[key]; });
+  return headers;
+}
+
+function apiFetch(url, options) {
+  const opts = Object.assign({}, options || {});
+  opts.headers = apiHeaders(opts.headers || {});
+  return fetch(url, opts);
+}
+
 async function autoDetectRootPath(dirName) {
   try {
-    const res = await fetch(`http://localhost:8765/api/find-dir?name=${encodeURIComponent(dirName)}`);
+    const res = await apiFetch(`/api/find-dir?name=${encodeURIComponent(dirName)}`);
     const data = await res.json();
     if (data.path) {
       S.rootAbsPath = data.path;
       saveRootPath();
+      if (typeof updateRootPathInput === 'function') updateRootPathInput();
     }
   } catch { /* server not running — user can set path manually */ }
 }
@@ -1120,7 +1134,7 @@ async function getFileObj(f) {
 // ================================================================
 async function logAction(action, detail) {
   try {
-    await fetch('http://localhost:8765/api/log', {
+    await apiFetch('/api/log', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action, detail, timestamp: new Date().toISOString() })
@@ -1130,25 +1144,32 @@ async function logAction(action, detail) {
 
 // ================================================================
 // SAFARI WRITE FALLBACK
-// Safari has no writable directory handles (no showDirectoryPicker at all),
-// so rename/move/copy/delete are routed to server.py, which performs them
-// with os/shutil. Every request is scoped to S.rootAbsPath — the server
-// re-validates that the target path actually resolves under that root
-// (see resolve_under_root in server.py) before touching anything, and the
-// server also rejects any request whose Origin header isn't this same app.
+// Browsers without a writable directory handle (Safari, Firefox) send
+// rename/move/copy/delete to server.py. Chrome/Edge/Brave also send Trash
+// there, so the file is moved on disk instead of uploaded. The server checks
+// that each path stays under S.rootAbsPath and, for files, that the size and
+// modification time match the row you selected.
 // ================================================================
 
-// f.path is a webkitRelativePath like "MyFolder/sub/file.txt". S.rootAbsPath
-// must be the absolute path of "MyFolder" itself (typed into the header path
-// pill) for this to resolve to a real filesystem path.
+// f.path looks like "MyFolder/sub/file.txt". S.rootAbsPath must be the
+// absolute path of the folder that path is relative to.
 function safariAbsPath(f) {
-  const rel = f.path.substring(f.path.indexOf('/') + 1);
-  return S.rootAbsPath.replace(/\/$/, '') + '/' + rel;
+  const rel = f.path.indexOf('/') === -1 ? '' : f.path.substring(f.path.indexOf('/') + 1);
+  return S.rootAbsPath.replace(/\/$/, '') + (rel ? '/' + rel : '');
+}
+
+function trashItemPayload(f) {
+  const item = { path: safariAbsPath(f), isDir: !!f.isDir };
+  if (!f.isDir) {
+    item.size = f.size;
+    item.mtimeMs = f.lastMod;
+  }
+  return item;
 }
 
 function requireRootAbsPath() {
   if (!S.rootAbsPath) {
-    toast('Set the absolute folder path in the header bar first (Safari can\'t supply it automatically).', 'warn');
+    toast('Set the absolute folder path in the header bar first. Trash and the Safari/Firefox file tools need it, and a wrong path is refused.', 'warn');
     return false;
   }
   return true;
@@ -1157,7 +1178,7 @@ function requireRootAbsPath() {
 async function _doRenameSafari(f, newName) {
   if (!requireRootAbsPath()) return;
   try {
-    const res = await fetch('http://localhost:8765/api/write/rename', {
+    const res = await apiFetch('/api/write/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ root: S.rootAbsPath, path: safariAbsPath(f), newName })
@@ -1173,55 +1194,39 @@ async function _doRenameSafari(f, newName) {
 
 async function _doMoveSafari(files, destDir) {
   let ok = 0, fail = 0;
+  const problems = [];
   for (const f of files) {
     try {
-      const res = await fetch('http://localhost:8765/api/write/move', {
+      const res = await apiFetch('/api/write/move', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ root: S.rootAbsPath, path: safariAbsPath(f), destDir })
       });
       const data = await res.json();
-      if (data.ok) { ok++; S.selected.delete(f.path); } else { fail++; console.error(data.error); }
-    } catch (e) { fail++; console.error(e); }
+      if (data.ok) { ok++; S.selected.delete(f.path); }
+      else { fail++; problems.push(f.name + ': ' + (data.error || 'failed')); console.error(data.error); }
+    } catch (e) { fail++; problems.push(f.name + ': ' + e.message); console.error(e); }
   }
-  fail === 0 ? toast(`Moved ${ok} file(s)`, 'success') : toast(`Moved ${ok}, failed ${fail}`, 'warn');
+  fail === 0 ? toast(`Moved ${ok} item(s)`, 'success') : toast(`Moved ${ok}, failed ${fail}. ${problems.slice(0, 3).join(' ')}`, 'warn');
   await refreshSafariDir();
 }
 
 async function _doCopySafari(files, destDir) {
   let ok = 0, fail = 0;
+  const problems = [];
   for (const f of files) {
     try {
-      const res = await fetch('http://localhost:8765/api/write/copy', {
+      const res = await apiFetch('/api/write/copy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ root: S.rootAbsPath, path: safariAbsPath(f), destDir })
       });
       const data = await res.json();
-      if (data.ok) ok++; else { fail++; console.error(data.error); }
-    } catch (e) { fail++; console.error(e); }
+      if (data.ok) ok++;
+      else { fail++; problems.push(f.name + ': ' + (data.error || 'failed')); console.error(data.error); }
+    } catch (e) { fail++; problems.push(f.name + ': ' + e.message); console.error(e); }
   }
-  fail === 0 ? toast(`Copied ${ok} file(s)`, 'success') : toast(`Copied ${ok}, failed ${fail}`, 'warn');
-}
-
-async function _doDeleteSafari(files) {
-  if (!requireRootAbsPath()) return;
-  try {
-    const res = await fetch('http://localhost:8765/api/trash', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ root: S.rootAbsPath, paths: files.map(safariAbsPath) })
-    });
-    const data = await res.json();
-    const ok = data.results.filter(r => r.ok).length;
-    const fail = data.results.length - ok;
-    files.forEach(f => S.selected.delete(f.path));
-    fail === 0 ? toast(`Moved ${ok} item(s) to Trash`, 'success') : toast(`Trashed ${ok}, failed ${fail} — check console`, 'warn');
-    if (fail) console.error('Trash failures:', data.results.filter(r => !r.ok));
-    await refreshSafariDir();
-  } catch (e) {
-    toast('Delete failed — is the FileVault server running?', 'error');
-  }
+  fail === 0 ? toast(`Copied ${ok} item(s)`, 'success') : toast(`Copied ${ok}, failed ${fail}. ${problems.slice(0, 3).join(' ')}`, 'warn');
 }
 
 // Re-reads the currently open folder in Safari mode by re-prompting the
@@ -1239,7 +1244,7 @@ async function tryRestoreLastDir() {
   if (perm === 'granted') {
     S.rootHandle = handle;
     initRootPath(handle.name);
-    autoDetectRootPath(handle.name);
+    await autoDetectRootPath(handle.name);
     await scanDirectory();
   } else {
     // Show reopen button with the saved folder name
@@ -1258,7 +1263,7 @@ async function reopenLastDir() {
   if (perm === 'granted') {
     S.rootHandle = handle;
     initRootPath(handle.name);
-    autoDetectRootPath(handle.name);
+    await autoDetectRootPath(handle.name);
     await scanDirectory();
   } else {
     toast('Permission denied — use Open Directory to pick the folder again', 'warn');
@@ -1383,7 +1388,7 @@ async function doOpenDirectory() {
     initRootPath(h.name);
     updateBackBtn();
     _IDB.save(h).catch(() => {});
-    autoDetectRootPath(h.name);
+    await autoDetectRootPath(h.name);
     await scanDirectory();
   } catch (e) {
     if (e.name !== 'AbortError') toast('Could not open directory: ' + e.message, 'error');
@@ -1551,10 +1556,17 @@ function addSideChildItem(parent, type, ext, count, color) {
   const d = document.createElement('div');
   d.className = 'sidebar-child' + (isActive ? ' active' : '');
   d.onclick = () => filterByExt(type, ext);
-  d.innerHTML = `
-    <span class="f-badge" style="background:${color}1a;color:${color};border:1px solid ${color}40;font-size:10px;padding:1px 5px;border-radius:3px">${ext.toUpperCase()}</span>
-    <span style="flex:1">.${ext}</span>
-    <span class="type-chip">${count}</span>`;
+  const badge = document.createElement('span');
+  badge.className = 'f-badge';
+  badge.style.cssText = `background:${color}1a;color:${color};border:1px solid ${color}40;font-size:10px;padding:1px 5px;border-radius:3px`;
+  badge.textContent = String(ext).toUpperCase();
+  const label = document.createElement('span');
+  label.style.flex = '1';
+  label.textContent = '.' + ext;
+  const chip = document.createElement('span');
+  chip.className = 'type-chip';
+  chip.textContent = String(count);
+  d.append(badge, label, chip);
   parent.appendChild(d);
 }
 
@@ -1929,10 +1941,10 @@ function renderTable() {
           html += `<td class="f-type" title="${escH(f.folder||'')}">${escH(fld)}</td>`; break;
         }
         case 'type':
-          html += `<td class="f-type">${f.type}</td>`; break;
+          html += `<td class="f-type">${escH(f.type)}</td>`; break;
         case 'ext': {
           const extLabel = f.ext ? f.ext.toUpperCase() : (f.isDir ? 'DIR' : '—');
-          html += `<td class="f-type"><span class="f-badge" style="background:${color}1a;color:${color};border:1px solid ${color}40">${extLabel}</span></td>`; break;
+          html += `<td class="f-type"><span class="f-badge" style="background:${color}1a;color:${color};border:1px solid ${color}40">${escH(extLabel)}</span></td>`; break;
         }
         case 'size':
           html += `<td class="f-size">${f.isDir?'—':fmtSize(f.size)}</td>`; break;
@@ -1966,11 +1978,21 @@ function renderGrid() {
     card.dataset.path  = f.path;
     card.dataset.isdir = f.isDir ? '1' : '0';
     card.title = f.isDir ? 'Double-click to open folder' : 'Double-click to preview';
-    card.innerHTML = `
-      <input type="checkbox" class="cb grid-cb" ${S.selected.has(f.path)?'checked':''}>
-      <div class="grid-ico">${iconOf(f.ext, f.isDir)}</div>
-      <div class="grid-name" title="${escH(f.path)}">${escH(f.name)}</div>
-      <div class="grid-ext">${f.ext ? f.ext.toUpperCase() : (f.isDir ? 'Folder' : '—')}</div>`;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'cb grid-cb';
+    cb.checked = S.selected.has(f.path);
+    const ico = document.createElement('div');
+    ico.className = 'grid-ico';
+    ico.textContent = iconOf(f.ext, f.isDir);
+    const nameEl = document.createElement('div');
+    nameEl.className = 'grid-name';
+    nameEl.title = f.path;
+    nameEl.textContent = f.name;
+    const extEl = document.createElement('div');
+    extEl.className = 'grid-ext';
+    extEl.textContent = f.ext ? f.ext.toUpperCase() : (f.isDir ? 'Folder' : '—');
+    card.append(cb, ico, nameEl, extEl);
     grd.appendChild(card);
   }
 }
@@ -2061,13 +2083,79 @@ function getSelFiles() { return S.allFiles.filter(f => S.selected.has(f.path)); 
 // ================================================================
 // FILE OPERATIONS
 // ================================================================
-async function copyFiles() {
-  const files = getSelFiles().filter(f => !f.isDir);
-  if (!files.length) { toast('Select files to copy (folders not supported)', 'warn'); return; }
+async function isSameDir(a, b) {
+  if (!a || !b || typeof a.isSameEntry !== 'function') return false;
+  try { return await a.isSameEntry(b); }
+  catch { return false; }
+}
 
-  // Safari has no directory picker to choose a destination with, so the
-  // absolute destination folder is typed directly; server.py validates it
-  // exists before copying anything.
+async function handleExists(dirHandle, name) {
+  try {
+    await dirHandle.getFileHandle(name);
+    return true;
+  } catch (e) {
+    if (e && e.name === 'TypeMismatchError') return true;
+    if (!e || e.name !== 'NotFoundError') throw e;
+  }
+  try {
+    await dirHandle.getDirectoryHandle(name);
+    return true;
+  } catch (e) {
+    if (e && e.name === 'NotFoundError') return false;
+    if (e && e.name === 'TypeMismatchError') return true;
+    throw e;
+  }
+  return false;
+}
+
+// Stream the bytes and check SHA-256 before the copy is kept. A failed
+// check deletes the new file and leaves the source alone.
+async function copyFileVerified(srcHandle, destDir, name) {
+  const srcFile = await srcHandle.getFile();
+  const outHandle = await destDir.getFileHandle(name, { create: true });
+  const writer = await outHandle.createWritable();
+  const hasher = createHasher('SHA-256');
+  const chunkSize = 2 * 1024 * 1024;
+  try {
+    for (let offset = 0; offset < srcFile.size; offset += chunkSize) {
+      const buf = await srcFile.slice(offset, Math.min(srcFile.size, offset + chunkSize)).arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      hasher.update(bytes);
+      await writer.write(bytes);
+    }
+    await writer.close();
+  } catch (e) {
+    try { await writer.abort(); } catch (_) {}
+    try { await destDir.removeEntry(name); } catch (_) {}
+    throw e;
+  }
+  const srcHex = hasher.hex();
+  const outFile = await outHandle.getFile();
+  if (outFile.size !== srcFile.size || srcHex !== await hashBlob(outFile, 'SHA-256')) {
+    try { await destDir.removeEntry(name); } catch (_) {}
+    throw new Error('Copy of “' + name + '” failed verification and was removed');
+  }
+}
+
+async function copyDirectory(srcHandle, destDir, name) {
+  const sub = await destDir.getDirectoryHandle(name, { create: true });
+  try {
+    for await (const [childName, child] of srcHandle.entries()) {
+      if (child.kind === 'directory') await copyDirectory(child, sub, childName);
+      else await copyFileVerified(child, sub, childName);
+    }
+  } catch (e) {
+    try { await destDir.removeEntry(name, { recursive: true }); } catch (_) {}
+    throw e;
+  }
+}
+
+async function copyFiles() {
+  const files = getSelFiles();
+  if (!files.length) { toast('Nothing selected', 'warn'); return; }
+
+  // Safari has no directory picker, so the destination is an absolute path.
+  // server.py refuses when that name already exists and checks the copy.
   if (S.readOnly) {
     if (!requireRootAbsPath()) return;
     const destDir = prompt('Absolute destination folder path:');
@@ -2080,25 +2168,35 @@ async function copyFiles() {
   try { dest = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' }); }
   catch (e) { if (e.name !== 'AbortError') toast('Could not open destination', 'error'); return; }
 
-  showProg('Copying', `Copying ${files.length} file(s)…`);
+  showProg('Copying', `Copying ${files.length} item(s)…`);
   let ok = 0, fail = 0;
+  const problems = [];
   for (let i = 0; i < files.length; i++) {
+    const f = files[i];
     try {
-      const fo = await files[i].handle.getFile();
-      const dh = await dest.getFileHandle(files[i].name, { create: true });
-      const wr = await dh.createWritable();
-      await wr.write(fo); await wr.close();
+      const same = await isSameDir(f.parentHandle, dest);
+      const taken = same ? true : await handleExists(dest, f.name);
+      const plan = planFileOp(same, taken);
+      if (!plan.ok) throw new Error(plan.error);
+      if (f.isDir) await copyDirectory(f.handle, dest, f.name);
+      else await copyFileVerified(f.handle, dest, f.name);
       ok++;
-    } catch (e) { fail++; console.error(e); }
+    } catch (e) {
+      fail++;
+      problems.push(f.name + ': ' + e.message);
+      console.error(e);
+    }
     setProg(Math.round((i + 1) / files.length * 100));
   }
   closeModal('modalProg');
-  fail === 0 ? toast(`Copied ${ok} file(s)`, 'success') : toast(`Copied ${ok}, failed ${fail}`, 'warn');
+  fail === 0
+    ? toast(`Copied ${ok} item(s). Each copy was checked with SHA-256.`, 'success')
+    : toast(`Copied ${ok}, failed ${fail}. ${problems.slice(0, 3).join(' ')}`, 'warn');
 }
 
 async function moveFiles() {
-  const files = getSelFiles().filter(f => !f.isDir);
-  if (!files.length) { toast('Select files to move (folders not supported)', 'warn'); return; }
+  const files = getSelFiles();
+  if (!files.length) { toast('Nothing selected', 'warn'); return; }
 
   if (S.readOnly) {
     if (!requireRootAbsPath()) return;
@@ -2112,23 +2210,40 @@ async function moveFiles() {
   try { dest = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' }); }
   catch (e) { if (e.name !== 'AbortError') toast('Could not open destination', 'error'); return; }
 
-  showProg('Moving', `Moving ${files.length} file(s)…`);
+  showProg('Moving', `Moving ${files.length} item(s)…`);
   let ok = 0, fail = 0;
+  const problems = [];
   for (let i = 0; i < files.length; i++) {
+    const f = files[i];
     try {
-      const fo = await files[i].handle.getFile();
-      const dh = await dest.getFileHandle(files[i].name, { create: true });
-      const wr = await dh.createWritable();
-      await wr.write(fo); await wr.close();
-      await files[i].parentHandle.removeEntry(files[i].name);
-      S.selected.delete(files[i].path);
-      logAction('move', `${files[i].path} -> ${dest.name}/${files[i].name}`);
+      // Same-folder and name collisions are refused before anything is written
+      // or deleted. handle.move() is a real rename, so timestamps and tags stay.
+      const same = await isSameDir(f.parentHandle, dest);
+      const taken = same ? true : await handleExists(dest, f.name);
+      const plan = planFileOp(same, taken);
+      if (!plan.ok) throw new Error(plan.error);
+      if (typeof f.handle.move === 'function') {
+        await f.handle.move(dest, f.name);
+      } else if (!f.isDir) {
+        await copyFileVerified(f.handle, dest, f.name);
+        await f.parentHandle.removeEntry(f.name);
+      } else {
+        throw new Error('This browser cannot move folders without copying them. Use Chrome, Edge, or Brave.');
+      }
+      S.selected.delete(f.path);
+      logAction('move', `${f.path} -> ${dest.name}/${f.name}`);
       ok++;
-    } catch (e) { fail++; console.error(e); }
+    } catch (e) {
+      fail++;
+      problems.push(f.name + ': ' + e.message);
+      console.error(e);
+    }
     setProg(Math.round((i + 1) / files.length * 100));
   }
   closeModal('modalProg');
-  fail === 0 ? toast(`Moved ${ok} file(s)`, 'success') : toast(`Moved ${ok}, failed ${fail}`, 'warn');
+  fail === 0
+    ? toast(`Moved ${ok} item(s)`, 'success')
+    : toast(`Moved ${ok}, failed ${fail}. ${problems.slice(0, 3).join(' ')}`, 'warn');
   await refreshDirectory();
 }
 
@@ -2176,32 +2291,34 @@ async function _doRename(f, newName) {
   // rename has to happen server-side (root-scoped — see server.py).
   if (S.readOnly) { await _doRenameSafari(f, newName); return; }
 
-  // Refuse to overwrite an existing different file
+  // Refuse to overwrite an existing different file. Only NotFoundError means
+  // the name is free; any other error leaves the original untouched.
+  let nameTaken = false;
   try {
-    await f.parentHandle.getFileHandle(newName);          // resolves = it exists
+    await f.parentHandle.getFileHandle(newName);
+    nameTaken = true;
+  } catch (e) {
+    if (e && e.name === 'TypeMismatchError') nameTaken = true;
+    else if (!e || e.name !== 'NotFoundError') {
+      toast('Rename failed (original is safe): ' + (e && e.message ? e.message : 'could not check the name'), 'error');
+      return;
+    }
+  }
+  if (nameTaken) {
     toast(`A file named “${newName}” already exists here. File NOT renamed.`, 'error');
     return;
-  } catch (_) { /* good — name is free */ }
+  }
 
-  let nh = null;
+  const usedMove = typeof f.handle.move === 'function';
   try {
-    const fo = await f.handle.getFile();
-    const origSize = fo.size;
-
-    // --- 2. Write the new file completely ---
-    nh = await f.parentHandle.getFileHandle(newName, { create: true });
-    const wr = await nh.createWritable();
-    await wr.write(fo);
-    await wr.close();
-
-    // --- 3. VERIFY the new file before deleting the original ---
-    const check = await nh.getFile();
-    if (check.size !== origSize) {
-      throw new Error(`size mismatch (wrote ${check.size} of ${origSize} bytes)`);
+    if (usedMove) {
+      // Real rename: inode, timestamps, and extended attributes stay.
+      await f.handle.move(newName);
+    } else {
+      // Older browsers: write a verified copy, and only then remove the original.
+      await copyFileVerified(f.handle, f.parentHandle, newName);
+      await f.parentHandle.removeEntry(f.name);
     }
-
-    // --- 4. Safe to remove the original now ---
-    await f.parentHandle.removeEntry(f.name);
     logAction('rename', `${f.path} -> ${f.folder}/${newName}`);
 
     // Transfer any computed hash to the new path so it survives the rename.
@@ -2238,8 +2355,9 @@ async function _doRename(f, newName) {
       titleEl.dataset.path = newPath;
     }
   } catch (e) {
-    // Roll back any partial new file; the ORIGINAL is still intact.
-    if (nh) { try { await f.parentHandle.removeEntry(newName); } catch (_) {} }
+    // A failed handle.move() does not leave a second copy. The copy fallback
+    // removes a partial new file itself; this is a second attempt.
+    if (!usedMove) { try { await f.parentHandle.removeEntry(newName); } catch (_) {} }
     toast('Rename failed (original is safe): ' + e.message, 'error');
   }
 }
@@ -2762,7 +2880,7 @@ async function previewLegacyBinary(fo, content, ext) {
     content.innerHTML = `
       <div class="prev-none">
         <span class="prev-none-ico">${iconOf(ext, false)}</span>
-        <p>No readable text found in <strong>.${ext}</strong></p>
+        <p>No readable text found in <strong>.${escH(ext)}</strong></p>
         <p style="margin-top:8px;font-size:12px;color:var(--txt-4)">Legacy binary format — open in a desktop application</p>
       </div>`;
     return;
@@ -2770,7 +2888,7 @@ async function previewLegacyBinary(fo, content, ext) {
 
   content.style.padding = '0';
   content.style.alignItems = 'flex-start';
-  content.innerHTML = `<div class="prev-docx" style="white-space:pre-wrap"><p style="color:var(--txt-4);font-size:11px;padding:10px 14px 6px;margin:0">⚠ Text extracted from legacy binary .${ext} — formatting not preserved</p>${escH(text.slice(0, 80000))}${text.length > 80000 ? '\n\n[… truncated]' : ''}</div>`;
+  content.innerHTML = `<div class="prev-docx" style="white-space:pre-wrap"><p style="color:var(--txt-4);font-size:11px;padding:10px 14px 6px;margin:0">⚠ Text extracted from legacy binary .${escH(ext)} — formatting not preserved</p>${escH(text.slice(0, 80000))}${text.length > 80000 ? '\n\n[… truncated]' : ''}</div>`;
 }
 
 function previewSelected() {
@@ -2898,15 +3016,22 @@ async function previewFile(f) {
   _prevRotation = 0;
   document.getElementById('prevRotBtns').style.display = '';
 
-  meta.innerHTML = `
-    <span class="prev-meta-k">Type</span>
-    <span class="prev-meta-v">${f.type}${f.ext ? ' .' + f.ext : ''}</span>
-    <span class="prev-meta-k">Size</span>
-    <span class="prev-meta-v">${fmtSize(f.size)}</span>
-    <span class="prev-meta-k">Modified</span>
-    <span class="prev-meta-v">${fmtDate(f.lastMod)}</span>
-    <span class="prev-meta-k">Path</span>
-    <span class="prev-meta-v wrap">${escH(f.path)}</span>`;
+  meta.replaceChildren();
+  const metaRows = [
+    ['Type', f.type + (f.ext ? ' .' + f.ext : '')],
+    ['Size', fmtSize(f.size)],
+    ['Modified', fmtDate(f.lastMod)],
+    ['Path', f.path],
+  ];
+  for (const [key, value] of metaRows) {
+    const k = document.createElement('span');
+    k.className = 'prev-meta-k';
+    k.textContent = key;
+    const v = document.createElement('span');
+    v.className = 'prev-meta-v' + (key === 'Path' ? ' wrap' : '');
+    v.textContent = value;
+    meta.append(k, v);
+  }
 
   try {
     const fo  = await getFileObj(f);
@@ -3019,7 +3144,7 @@ async function previewFile(f) {
     content.innerHTML = `
       <div class="prev-none">
         <span class="prev-none-ico">${iconOf(f.ext, false)}</span>
-        <p>No preview for <strong>.${f.ext || 'this file type'}</strong></p>
+        <p>No preview for <strong>.${escH(f.ext || 'this file type')}</strong></p>
         <p style="margin-top:8px;font-size:12px">${fmtSize(f.size)}</p>
       </div>`;
   } catch (e) {
@@ -3077,7 +3202,8 @@ async function navigateBack() {
 
 function initRootPath(dirName) {
   const stored = localStorage.getItem('fv_rootpath_' + dirName);
-  S.rootAbsPath = stored !== null ? stored : '/Volumes/' + dirName;
+  // Never invent /Volumes/<name>. That guess can point Trash at a different folder.
+  S.rootAbsPath = stored || '';
   updateRootPathInput();
 }
 
@@ -3114,7 +3240,7 @@ function hashCellHTML(f) {
     return `<span class="hash-spin">⟳</span>`;
   if (h.status === 'done') {
     // Show full hash — column width (resizable) controls how much is visible
-    return `<span class="hash-val hash-copy" data-hval="${h.value}" title="${h.algo}: ${h.value}&#10;&#10;Click to copy">${h.value}</span>`
+    return `<span class="hash-val hash-copy" data-hval="${escH(h.value)}" title="${escH(h.algo + ': ' + h.value)}&#10;&#10;Click to copy">${escH(h.value)}</span>`
          + `<button class="hash-btn hash-compute" title="Recompute hash">↺</button>`
          + `<button class="hash-btn hash-clear"   title="Remove this hash">✕</button>`;
   }
@@ -3172,15 +3298,9 @@ async function hashFile(path) {
   S.hashes.set(path, { status: 'computing' });
   updateHashCell(path);
   try {
-    const fo  = await getFileObj(f);
-    const buf = await fo.arrayBuffer();
-    let value;
-    if (S.hashAlgo === 'MD5') {
-      value = md5(buf);
-    } else {
-      const digest = await crypto.subtle.digest(S.hashAlgo, buf);
-      value = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2,'0')).join('');
-    }
+    const fo = await getFileObj(f);
+    // Chunked read. crypto.subtle.digest() needs the whole file in memory.
+    const value = await hashBlob(fo, S.hashAlgo);
     S.hashes.set(path, { status: 'done', value, algo: S.hashAlgo });
   } catch (e) {
     S.hashes.set(path, { status: 'error', msg: e.message });
@@ -3255,19 +3375,17 @@ function deleteFiles() {
   if (nf) msg += `${nf} file${nf>1?'s':''}`;
   if (nf && nd) msg += ' and ';
   if (nd) msg += `${nd} folder${nd>1?'s':''}`;
-  if (!S.rootAbsPath) msg += '<br><small style="color:var(--red)">⚠ Set the root path in the header bar first.</small>';
-  document.getElementById('delDesc').innerHTML = msg;
+  const desc = document.getElementById('delDesc');
+  desc.replaceChildren(document.createTextNode(msg));
+  if (!S.rootAbsPath) {
+    desc.append(document.createElement('br'));
+    const note = document.createElement('small');
+    note.style.color = 'var(--red)';
+    note.textContent = 'Set the absolute folder path in the header bar first. Nothing is deleted until that path matches these files.';
+    desc.append(note);
+  }
   _pendingDel = files;
   openModal('modalDelete');
-}
-
-async function _getHandleByRel(rel) {
-  const parts = rel.split('/').filter(Boolean);
-  let handle = S.rootHandle;
-  for (let i = 0; i < parts.length - 1; i++) {
-    handle = await handle.getDirectoryHandle(parts[i]);
-  }
-  return { parent: handle, name: parts[parts.length - 1] };
 }
 
 async function confirmDelete() {
@@ -3275,44 +3393,41 @@ async function confirmDelete() {
   if (!_pendingDel) return;
   const files = _pendingDel; _pendingDel = null;
 
-  if (S.readOnly) { await _doDeleteSafari(files.filter(f => !f.isDir)); return; }
+  if (!S.rootAbsPath && S.rootHandle) await autoDetectRootPath(S.rootHandle.name);
+  if (!requireRootAbsPath()) return;
 
-  if (!S.rootHandle) {
-    toast('No directory open — open a folder first.', 'warn');
-    return;
-  }
-
-  showProg('Moving to Trash', `Sending ${files.length} item(s) to Trash…`);
+  showProg('Moving to Trash', `Moving ${files.length} item(s) to Trash…`);
   let ok = 0, fail = 0;
-  for (const f of files) {
-    try {
-      const rel = f.path.substring(f.path.indexOf('/') + 1);
-      const { parent, name } = await _getHandleByRel(rel);
-      const fh = await parent.getFileHandle(name);
-      const file = await fh.getFile();
-      const buf = await file.arrayBuffer();
-      const res = await fetch(`http://localhost:8765/api/trash-upload?name=${encodeURIComponent(name)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: buf
-      });
-      if (!res.ok) throw new Error('Server ' + res.status);
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'unknown');
-      await parent.removeEntry(name);
-      S.selected.delete(f.path);
-      S.hashes.delete(f.path);
-      ok++;
-    } catch (e) {
-      console.error('Trash failed for', f.name, e);
-      fail++;
+  try {
+    const res = await apiFetch('/api/trash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: S.rootAbsPath, items: files.map(trashItemPayload) })
+    });
+    const data = await res.json();
+    if (!res.ok || !Array.isArray(data.results)) {
+      throw new Error((data && data.error) || ('Server ' + res.status));
     }
+    const results = data.results;
+    ok = results.filter(r => r.ok).length;
+    fail = results.length - ok;
+    if (ok) {
+      files.forEach(f => { S.selected.delete(f.path); S.hashes.delete(f.path); });
+    }
+    if (fail) console.error('Trash failures:', results.filter(r => !r.ok));
+  } catch (e) {
+    fail = files.length;
+    console.error(e);
+    toast('Delete failed — is the FileVault server running?', 'error');
   }
   closeModal('modalProg');
-  fail === 0
-    ? toast(`Moved ${ok} item(s) to Trash`, 'success')
-    : toast(`Trashed ${ok}, failed ${fail} — check console`, 'warn');
-  await refreshDirectory();
+  if (fail !== files.length || ok) {
+    fail === 0
+      ? toast(`Moved ${ok} item(s) to Trash`, 'success')
+      : toast(`Trashed ${ok}, failed ${fail}. Check the folder path if a file was refused.`, 'warn');
+  }
+  if (S.readOnly) await refreshSafariDir();
+  else await refreshDirectory();
 }
 
 // ================================================================
@@ -3365,7 +3480,11 @@ function toast(msg, type = 'info') {
   const c = document.getElementById('toasts');
   const t = document.createElement('div');
   t.className = `toast ${type}`;
-  t.innerHTML = `<span>${icons[type]||''}</span><span>${msg}</span>`;
+  const ico = document.createElement('span');
+  ico.textContent = icons[type] || '';
+  const text = document.createElement('span');
+  text.textContent = String(msg);
+  t.append(ico, text);
   c.appendChild(t);
   setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 4200);
 }
@@ -3391,13 +3510,6 @@ function fmtDate(ts) {
     year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
 }
 
-function escH(s) {
-  const d = document.createElement('div');
-  d.appendChild(document.createTextNode(String(s)));
-  return d.innerHTML;
-}
-function esc(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
-
 // ================================================================
 // KEYBOARD SHORTCUTS
 // ================================================================
@@ -3417,42 +3529,341 @@ document.addEventListener('keydown', e => {
 });
 
 // ================================================================
-// MD5 — RFC 1321, pure JS
+// Escaping and streaming hashes. Kept free of DOM calls so tests can
+// run this section directly. Names, paths, and metadata must go through
+// escH before they are placed in HTML.
 // ================================================================
-function md5(buffer) {
-  const b  = new Uint8Array(buffer);
-  const ol = b.length;
-  const pl = Math.ceil((ol + 9) / 64) * 64;
-  const p  = new Uint8Array(pl);
-  p.set(b); p[ol] = 0x80;
-  const dv = new DataView(p.buffer);
-  dv.setUint32(pl - 8, (ol * 8) >>> 0, true);
-  dv.setUint32(pl - 4, Math.floor(ol / 0x20000000), true);
+// BEGIN TESTABLE
+function escH(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function planFileOp(sameFolder, nameTaken) {
+  if (sameFolder) return { ok: false, error: 'already in this folder' };
+  if (nameTaken) return { ok: false, error: 'destination already exists' };
+  return { ok: true };
+}
+
+function toBytes(chunk) {
+  if (chunk instanceof Uint8Array) return new Uint8Array(chunk);
+  return new Uint8Array(chunk);
+}
+
+function makeStreamer(blockSize, processBlock) {
+  let pending = new Uint8Array(0);
+  let total = 0;
+  function absorb(chunk, count) {
+    const bytes = toBytes(chunk);
+    if (count) total += bytes.length;
+    if (!bytes.length) return;
+    let data = bytes;
+    if (pending.length) {
+      data = new Uint8Array(pending.length + bytes.length);
+      data.set(pending);
+      data.set(bytes, pending.length);
+    }
+    let off = 0;
+    while (data.length - off >= blockSize) {
+      processBlock(data.subarray(off, off + blockSize));
+      off += blockSize;
+    }
+    pending = new Uint8Array(data.subarray(off));
+  }
+  return {
+    update(chunk) { absorb(chunk, true); },
+    pad(padding) { absorb(padding, false); },
+    pending() { return pending; },
+    total() { return total; },
+  };
+}
+
+function u32(x) { return x >>> 0; }
+function rotl(x, n) { return u32((x << n) | (x >>> (32 - n))); }
+function rotr(x, n) { return u32((x >>> n) | (x << (32 - n))); }
+
+function createMd5() {
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
   const SH = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
               5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
               4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
               6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
-  const K  = Array.from({length:64}, (_,i) => (Math.abs(Math.sin(i+1)) * 2**32) >>> 0);
-  let [a0,b0,c0,d0] = [0x67452301,0xefcdab89,0x98badcfe,0x10325476];
-  for (let off = 0; off < pl; off += 64) {
-    const M = Array.from({length:16}, (_,j) => dv.getUint32(off + j*4, true));
-    let [a,b,c,d] = [a0,b0,c0,d0];
+  const K = Array.from({ length: 64 }, (_, i) => u32(Math.abs(Math.sin(i + 1)) * 2 ** 32));
+  function process(block) {
+    const dv = new DataView(block.buffer, block.byteOffset, 64);
+    const M = Array.from({ length: 16 }, (_, j) => dv.getUint32(j * 4, true));
+    let a = a0, b = b0, c = c0, d = d0;
     for (let i = 0; i < 64; i++) {
-      let F, g;
-      if      (i<16) { F=(b&c)|(~b&d); g=i; }
-      else if (i<32) { F=(d&b)|(~d&c); g=(5*i+1)%16; }
-      else if (i<48) { F=b^c^d;        g=(3*i+5)%16; }
-      else           { F=c^(b|~d);     g=(7*i)%16; }
-      const t=d; d=c; c=b;
-      const s=((F+a+K[i]+M[g])|0);
-      b=(b+((s<<SH[i])|(s>>>(32-SH[i]))))|0; a=t;
+      let f, g;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+      const t = d;
+      d = c;
+      c = b;
+      const sum = u32(f + a + K[i] + M[g]);
+      b = u32(b + rotl(sum, SH[i]));
+      a = t;
     }
-    a0=(a0+a)|0; b0=(b0+b)|0; c0=(c0+c)|0; d0=(d0+d)|0;
+    a0 = u32(a0 + a); b0 = u32(b0 + b); c0 = u32(c0 + c); d0 = u32(d0 + d);
   }
-  return [a0,b0,c0,d0].map(w => {
-    let h=''; for(let i=0;i<4;i++) h+=((w>>>(i*8))&0xff).toString(16).padStart(2,'0'); return h;
-  }).join('');
+  const stream = makeStreamer(64, process);
+  return {
+    update: stream.update,
+    hex() {
+      const bitLen = stream.total() * 8;
+      const rem = stream.pending().length;
+      const padLen = rem < 56 ? 56 - rem : 120 - rem;
+      const padding = new Uint8Array(padLen + 8);
+      padding[0] = 0x80;
+      const view = new DataView(padding.buffer);
+      view.setUint32(padLen, u32(bitLen), true);
+      view.setUint32(padLen + 4, Math.floor(bitLen / 2 ** 32), true);
+      stream.pad(padding);
+      const words = [a0, b0, c0, d0];
+      return words.map(word => {
+        let hex = '';
+        for (let i = 0; i < 4; i++) hex += ((word >>> (i * 8)) & 0xff).toString(16).padStart(2, '0');
+        return hex;
+      }).join('');
+    },
+  };
 }
+
+function createSha1() {
+  let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+  function process(block) {
+    const w = new Array(80);
+    const dv = new DataView(block.buffer, block.byteOffset, 64);
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(i * 4, false);
+    for (let i = 16; i < 80; i++) w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    let a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (let i = 0; i < 80; i++) {
+      let f, k;
+      if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+      else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      const temp = u32(rotl(a, 5) + f + e + k + w[i]);
+      e = d; d = c; c = u32(rotl(b, 30)); b = a; a = temp;
+    }
+    h0 = u32(h0 + a); h1 = u32(h1 + b); h2 = u32(h2 + c); h3 = u32(h3 + d); h4 = u32(h4 + e);
+  }
+  const stream = makeStreamer(64, process);
+  return {
+    update: stream.update,
+    hex() {
+      const bitLen = stream.total() * 8;
+      const rem = stream.pending().length;
+      const padLen = rem < 56 ? 56 - rem : 120 - rem;
+      const padding = new Uint8Array(padLen + 8);
+      padding[0] = 0x80;
+      const view = new DataView(padding.buffer);
+      const hi = Math.floor(bitLen / 2 ** 32);
+      const lo = u32(bitLen);
+      view.setUint32(padLen, hi, false);
+      view.setUint32(padLen + 4, lo, false);
+      stream.pad(padding);
+      return [h0, h1, h2, h3, h4].map(word => word.toString(16).padStart(8, '0')).join('');
+    },
+  };
+}
+
+let _sha256Constants = null;
+function sha256Constants() {
+  if (_sha256Constants) return _sha256Constants;
+  const primes = firstPrimes(64);
+  _sha256Constants = {
+    H: primes.slice(0, 8).map(p => Number(sqrtFrac(p, 32))),
+    K: primes.map(p => Number(cbrtFrac(p, 32))),
+  };
+  return _sha256Constants;
+}
+
+function createSha256() {
+  const { H, K } = sha256Constants();
+  const state = H.slice();
+  function process(block) {
+    const w = new Array(64);
+    const dv = new DataView(block.buffer, block.byteOffset, 64);
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = u32(w[i - 16] + s0 + w[i - 7] + s1);
+    }
+    let [a, b, c, d, e, f, g, h] = state;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = u32(h + S1 + ch + K[i] + w[i]);
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = u32(S0 + maj);
+      h = g; g = f; f = e; e = u32(d + t1); d = c; c = b; b = a; a = u32(t1 + t2);
+    }
+    for (let i = 0; i < 8; i++) state[i] = u32(state[i] + [a, b, c, d, e, f, g, h][i]);
+  }
+  const stream = makeStreamer(64, process);
+  return {
+    update: stream.update,
+    hex() {
+      finishBits(stream, 64, 56, 8);
+      return state.map(word => word.toString(16).padStart(8, '0')).join('');
+    },
+  };
+}
+
+const MASK64 = (1n << 64n) - 1n;
+function rotr64(x, n) {
+  const s = BigInt(n);
+  return ((x >> s) | (x << (64n - s))) & MASK64;
+}
+function shr64(x, n) { return x >> BigInt(n); }
+
+let _sha512Constants = null;
+function sha512Constants() {
+  if (_sha512Constants) return _sha512Constants;
+  const primes = firstPrimes(80);
+  _sha512Constants = {
+    H: primes.slice(0, 8).map(p => sqrtFrac(p, 64)),
+    K: primes.map(p => cbrtFrac(p, 64)),
+  };
+  return _sha512Constants;
+}
+
+function createSha512() {
+  const constants = sha512Constants();
+  const state = constants.H.slice();
+  const K = constants.K;
+  function process(block) {
+    const w = new Array(80);
+    const dv = new DataView(block.buffer, block.byteOffset, 128);
+    for (let i = 0; i < 16; i++) {
+      const hi = BigInt(dv.getUint32(i * 8, false));
+      const lo = BigInt(dv.getUint32(i * 8 + 4, false));
+      w[i] = ((hi << 32n) | lo) & MASK64;
+    }
+    for (let i = 16; i < 80; i++) {
+      const s0 = rotr64(w[i - 15], 1) ^ rotr64(w[i - 15], 8) ^ shr64(w[i - 15], 7);
+      const s1 = rotr64(w[i - 2], 19) ^ rotr64(w[i - 2], 61) ^ shr64(w[i - 2], 6);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & MASK64;
+    }
+    let [a, b, c, d, e, f, g, h] = state;
+    for (let i = 0; i < 80; i++) {
+      const S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
+      const ch = (e & f) ^ ((~e) & g);
+      const t1 = (h + S1 + ch + K[i] + w[i]) & MASK64;
+      const S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) & MASK64;
+      h = g; g = f; f = e; e = (d + t1) & MASK64; d = c; c = b; b = a; a = (t1 + t2) & MASK64;
+    }
+    const next = [a, b, c, d, e, f, g, h];
+    for (let i = 0; i < 8; i++) state[i] = (state[i] + next[i]) & MASK64;
+  }
+  const stream = makeStreamer(128, process);
+  return {
+    update: stream.update,
+    hex() {
+      finishBits(stream, 128, 112, 16);
+      return state.map(word => word.toString(16).padStart(16, '0')).join('');
+    },
+  };
+}
+
+function finishBits(stream, blockSize, lenAt, lenBytes) {
+  const bitLen = BigInt(stream.total()) * 8n;
+  const rem = stream.pending().length;
+  const target = lenAt;
+  const padLen = rem < target ? target - rem : blockSize - rem + target;
+  const padding = new Uint8Array(padLen + lenBytes);
+  padding[0] = 0x80;
+  const view = new DataView(padding.buffer);
+  if (lenBytes === 8) {
+    const hi = Number((bitLen >> 32n) & 0xffffffffn);
+    const lo = Number(bitLen & 0xffffffffn);
+    view.setUint32(padLen, hi, false);
+    view.setUint32(padLen + 4, lo, false);
+  } else {
+    // 128-bit big-endian length. Files we hash fit in the low 64 bits.
+    view.setUint32(padLen + 8, Number((bitLen >> 32n) & 0xffffffffn), false);
+    view.setUint32(padLen + 12, Number(bitLen & 0xffffffffn), false);
+  }
+  stream.pad(padding);
+}
+
+function firstPrimes(n) {
+  const primes = [];
+  for (let x = 2; primes.length < n; x++) {
+    let prime = true;
+    for (let d = 2; d * d <= x; d++) {
+      if (x % d === 0) { prime = false; break; }
+    }
+    if (prime) primes.push(x);
+  }
+  return primes;
+}
+
+function isqrt(n) {
+  if (n < 2n) return n;
+  let x = 1n << (bitLength(n) / 2n + 1n);
+  for (;;) {
+    const y = (x + n / x) >> 1n;
+    if (y >= x) return x;
+    x = y;
+  }
+}
+function bitLength(n) {
+  let bits = 0n;
+  let v = n;
+  while (v > 0n) { v >>= 1n; bits++; }
+  return bits;
+}
+function icbrt(n) {
+  if (n < 2n) return n;
+  let x = 1n << (bitLength(n) / 3n + 1n);
+  for (;;) {
+    const y = (2n * x + n / (x * x)) / 3n;
+    if (y >= x) return x;
+    x = y;
+  }
+}
+function sqrtFrac(prime, bits) {
+  const full = isqrt(BigInt(prime) << (2n * BigInt(bits)));
+  return full & ((1n << BigInt(bits)) - 1n);
+}
+function cbrtFrac(prime, bits) {
+  const full = icbrt(BigInt(prime) << (3n * BigInt(bits)));
+  return full & ((1n << BigInt(bits)) - 1n);
+}
+
+function createHasher(algo) {
+  const name = String(algo).toUpperCase().replace(/-/g, '');
+  if (name === 'MD5') return createMd5();
+  if (name === 'SHA1') return createSha1();
+  if (name === 'SHA256') return createSha256();
+  if (name === 'SHA512') return createSha512();
+  throw new Error('Unsupported hash: ' + algo);
+}
+
+async function hashBlob(blob, algo) {
+  const hasher = createHasher(algo);
+  const chunkSize = 2 * 1024 * 1024;
+  const size = blob.size;
+  for (let offset = 0; offset < size; offset += chunkSize) {
+    const buf = await blob.slice(offset, Math.min(size, offset + chunkSize)).arrayBuffer();
+    hasher.update(new Uint8Array(buf));
+  }
+  return hasher.hex();
+}
+
+// END TESTABLE
 
 // ================================================================
 // EVENT DELEGATION — table body (click = preview file, dblclick = open folder)
