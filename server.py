@@ -304,6 +304,19 @@ def _darwin_copyfile(src, dst, flags):
     raise OSError(err, message, str(src), None, str(dst))
 
 
+def _timestamp_ns(st, name):
+    """Nanoseconds for st_mtime, st_atime, or st_birthtime.
+
+    CPython 3.14 on macOS has st_birthtime and not st_birthtime_ns.
+    """
+    if hasattr(st, name + '_ns'):
+        return getattr(st, name + '_ns')
+    seconds = getattr(st, name, None)
+    if seconds is None:
+        return None
+    return int(round(seconds * 1_000_000_000))
+
+
 def _restore_darwin_times(src, dst):
     """Copy creation, modification, and access times. Failure leaves the copy.
 
@@ -312,8 +325,16 @@ def _restore_darwin_times(src, dst):
     """
     import ctypes
     src_stat = os.lstat(src)
-    birth_ns = getattr(src_stat, 'st_birthtime_ns', None)
+    birth_ns = _timestamp_ns(src_stat, 'st_birthtime')
+    mtime_ns = _timestamp_ns(src_stat, 'st_mtime')
+    atime_ns = _timestamp_ns(src_stat, 'st_atime')
+    if mtime_ns is None or atime_ns is None:
+        return
     if birth_ns is None:
+        try:
+            os.utime(dst, ns=(atime_ns, mtime_ns))
+        except OSError:
+            pass
         return
     lib = _load_darwin_lib()
     attrs = lib.AttrList()
@@ -329,8 +350,8 @@ def _restore_darwin_times(src, dst):
         return spec
 
     buf.cr = timespec(birth_ns)
-    buf.mod = timespec(src_stat.st_mtime_ns)
-    buf.acc = timespec(src_stat.st_atime_ns)
+    buf.mod = timespec(mtime_ns)
+    buf.acc = timespec(atime_ns)
     result = lib.setattrlist(
         os.fsencode(dst), ctypes.byref(attrs), ctypes.byref(buf),
         ctypes.sizeof(buf), _FSOPT_NOFOLLOW,
@@ -338,7 +359,7 @@ def _restore_darwin_times(src, dst):
     if result == 0:
         return
     try:
-        os.utime(dst, ns=(src_stat.st_atime_ns, src_stat.st_mtime_ns))
+        os.utime(dst, ns=(atime_ns, mtime_ns))
     except OSError:
         pass
 

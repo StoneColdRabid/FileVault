@@ -181,6 +181,17 @@ def set_birthtime_ns(path, birth_ns):
         raise OSError(err, os.strerror(err) or 'setattrlist failed', str(path))
 
 
+def birthtime_ns(path):
+    """Creation time in nanoseconds.
+
+    The macOS CPython build in CI exposes st_birthtime and not st_birthtime_ns.
+    """
+    st = os.lstat(path)
+    if hasattr(st, 'st_birthtime_ns'):
+        return st.st_birthtime_ns
+    return int(round(st.st_birthtime * 1_000_000_000))
+
+
 class ServerTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -495,14 +506,17 @@ class FileOperationTests(unittest.TestCase):
         src.write_bytes(b'tagged-bytes')
         xattr_set(src, FINDER_TAG_ATTR, tag)
         xattr_set(src, FINDER_COMMENT_ATTR, comment)
-        set_birthtime_ns(src, 1_000_000_000_000_000_000 + 123_456_789)
+        # Whole seconds stay exact in st_birthtime, which is a float on macOS.
+        # Set the creation time after mtime so a later utime cannot clear it.
         os.utime(src, ns=(1_700_000_000_000_000_000, 1_700_000_100_000_000_000))
+        set_birthtime_ns(src, 1_000_000_000 * 1_000_000_000)
         stored_tag = xattr_get(src, FINDER_TAG_ATTR)
         stored_comment = xattr_get(src, FINDER_COMMENT_ATTR)
         self.assertIsNotNone(stored_tag, 'Finder tag was not stored on the source')
         self.assertEqual(plistlib.loads(stored_tag), ['Red\n6'])
         self.assertEqual(plistlib.loads(stored_comment), 'Quarterly receipt')
-        self.assertLess(src.stat().st_birthtime_ns // 1_000_000_000, 1_100_000_000)
+        self.assertEqual(birthtime_ns(src) // 1_000_000_000, 1_000_000_000)
+        self.assertEqual(src.stat().st_mtime_ns, 1_700_000_100_000_000_000)
 
         dest = self.root / 'dest'
         dest.mkdir()
@@ -516,7 +530,7 @@ class FileOperationTests(unittest.TestCase):
         with self.subTest('finder comment'):
             self.assertEqual(xattr_get(copied, FINDER_COMMENT_ATTR), stored_comment)
         with self.subTest('file creation time'):
-            self.assertEqual(copied.stat().st_birthtime_ns, src.stat().st_birthtime_ns)
+            self.assertEqual(birthtime_ns(copied), birthtime_ns(src))
         self.assertEqual(copied.stat().st_mtime_ns, src.stat().st_mtime_ns)
 
         folder = self.root / 'tagged-dir'
@@ -525,10 +539,10 @@ class FileOperationTests(unittest.TestCase):
         inner.write_text('inside')
         xattr_set(inner, FINDER_TAG_ATTR, tag)
         xattr_set(folder, FINDER_TAG_ATTR, tag)
-        set_birthtime_ns(inner, 1_000_000_000_000_000_000 + 222)
-        set_birthtime_ns(folder, 1_000_000_000_000_000_000 + 333)
         os.utime(inner, ns=(1_600_000_000_000_000_000, 1_600_000_060_000_000_000))
         os.utime(folder, ns=(1_600_000_000_000_000_000, 1_600_000_050_000_000_000))
+        set_birthtime_ns(inner, 1_000_000_001 * 1_000_000_000)
+        set_birthtime_ns(folder, 1_000_000_002 * 1_000_000_000)
         inner_tag = xattr_get(inner, FINDER_TAG_ATTR)
         folder_tag = xattr_get(folder, FINDER_TAG_ATTR)
         self.assertEqual(plistlib.loads(inner_tag), ['Red\n6'])
@@ -545,9 +559,9 @@ class FileOperationTests(unittest.TestCase):
         with self.subTest('tag on the copied folder'):
             self.assertEqual(xattr_get(copied_folder, FINDER_TAG_ATTR), folder_tag)
         with self.subTest('creation time inside a copied folder'):
-            self.assertEqual(copied_inner.stat().st_birthtime_ns, inner.stat().st_birthtime_ns)
+            self.assertEqual(birthtime_ns(copied_inner), birthtime_ns(inner))
         with self.subTest('creation time of the copied folder'):
-            self.assertEqual(copied_folder.stat().st_birthtime_ns, folder.stat().st_birthtime_ns)
+            self.assertEqual(birthtime_ns(copied_folder), birthtime_ns(folder))
         self.assertEqual(copied_inner.stat().st_mtime_ns, inner.stat().st_mtime_ns)
         self.assertEqual(copied_folder.stat().st_mtime_ns, folder.stat().st_mtime_ns)
 
