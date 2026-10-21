@@ -371,6 +371,13 @@ def _remove_copy(dst):
         dst.unlink(missing_ok=True)
 
 
+def _remove_failed_copy(dst, exc):
+    """Drop a partial copy. EEXIST means some other file already has that name."""
+    if exc.errno == errno.EEXIST:
+        return
+    _remove_copy(dst)
+
+
 def copy_path(src, dst):
     """Copy src to dst. dst must not exist. File bytes are checked with SHA-256.
 
@@ -393,8 +400,8 @@ def copy_path(src, dst):
         if sys.platform == 'darwin':
             try:
                 _darwin_copyfile(src, dst, _DARWIN_DIR_FLAGS)
-            except OSError:
-                _remove_copy(dst)
+            except OSError as exc:
+                _remove_failed_copy(dst, exc)
                 raise
         else:
             dst.mkdir()
@@ -416,8 +423,8 @@ def copy_path(src, dst):
     if sys.platform == 'darwin':
         try:
             _darwin_copyfile(src, dst, _DARWIN_FILE_FLAGS)
-        except OSError:
-            _remove_copy(dst)
+        except OSError as exc:
+            _remove_failed_copy(dst, exc)
             raise
     else:
         shutil.copy2(src, dst, follow_symlinks=False)

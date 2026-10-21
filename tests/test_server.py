@@ -3,6 +3,7 @@
 These exercise the real server: loopback binding, per-launch token, origin
 and Host checks, and copy/move/rename/trash behavior on throwaway files.
 """
+import errno
 import hashlib
 import http.client
 import json
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import uuid
 from pathlib import Path
 
@@ -564,6 +566,49 @@ class FileOperationTests(unittest.TestCase):
             self.assertEqual(birthtime_ns(copied_folder), birthtime_ns(folder))
         self.assertEqual(copied_inner.stat().st_mtime_ns, inner.stat().st_mtime_ns)
         self.assertEqual(copied_folder.stat().st_mtime_ns, folder.stat().st_mtime_ns)
+
+    def test_copyfile_eexist_leaves_the_destination_that_won_the_race(self):
+        """COPYFILE_EXCL lost the race: do not delete the file that appeared.
+
+        copy_path sees no destination, then copyfile fails with EEXIST because
+        that name was created in between. The loser must leave the winner alone.
+        """
+        src_file = self.root / 'src.txt'
+        src_file.write_text('source')
+        src_dir = self.root / 'srcdir'
+        src_dir.mkdir()
+        (src_dir / 'child.txt').write_text('child')
+
+        def occupy_then_eexist(kind):
+            def race(_src, dst, _flags):
+                target = Path(dst)
+                if kind == 'folder':
+                    target.mkdir()
+                    (target / 'kept.txt').write_text('preexisting')
+                else:
+                    target.write_text('preexisting')
+                raise OSError(errno.EEXIST, os.strerror(errno.EEXIST))
+            return race
+
+        cases = (
+            ('file', src_file, self.root / 'raced.txt'),
+            ('folder', src_dir, self.root / 'raced-dir'),
+        )
+        for kind, src, dst in cases:
+            with self.subTest(kind):
+                with unittest.mock.patch.object(server.sys, 'platform', 'darwin'), \
+                     unittest.mock.patch.object(
+                         server, '_darwin_copyfile', side_effect=occupy_then_eexist(kind),
+                     ):
+                    with self.assertRaises(OSError) as caught:
+                        server.copy_path(src, dst)
+                self.assertEqual(caught.exception.errno, errno.EEXIST)
+                self.assertTrue(dst.exists(), 'existing destination was removed')
+                if kind == 'folder':
+                    self.assertEqual((dst / 'kept.txt').read_text(), 'preexisting')
+                else:
+                    self.assertEqual(dst.read_text(), 'preexisting')
+                self.assertTrue(src.exists())
 
     def test_move_same_folder_does_not_delete_or_rename(self):
         src = self.root / 'keep.txt'
