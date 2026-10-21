@@ -9,25 +9,62 @@ import json
 import os
 import shutil
 import stat
+import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 
 import server
 
 
 def listening_v4(port):
-    """Return raw local addresses from /proc/net/tcp that are LISTEN on port."""
-    hexport = f'{port:04X}'
+    """Return raw local IPv4 addresses that are LISTEN on port.
+
+    On Linux these are the little-endian hex addresses from /proc/net/tcp
+    (127.0.0.1 is 0100007F, 0.0.0.0 is 00000000). macOS has no /proc, so the
+    same two values are derived from lsof. Other addresses are returned as
+    text so a non-loopback listener still fails the assertion.
+    """
+    if Path('/proc/net/tcp').exists():
+        hexport = f'{port:04X}'
+        found = []
+        text = Path('/proc/net/tcp').read_text().splitlines()[1:]
+        for line in text:
+            parts = line.split()
+            local, state = parts[1], parts[3]
+            ip, pt = local.split(':')
+            if pt.upper() == hexport and state == '0A':
+                found.append(ip.upper())
+        return found
+    proc = subprocess.run(
+        ['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode not in (0, 1):
+        raise OSError(proc.stderr.strip() or f'lsof exited {proc.returncode}')
     found = []
-    text = Path('/proc/net/tcp').read_text().splitlines()[1:]
-    for line in text:
-        parts = line.split()
-        local, state = parts[1], parts[3]
-        ip, pt = local.split(':')
-        if pt.upper() == hexport and state == '0A':
-            found.append(ip.upper())
+    for line in proc.stdout.splitlines()[1:]:
+        for part in line.split():
+            host, sep, port_s = part.rpartition(':')
+            if not sep or port_s != str(port):
+                continue
+            if host.startswith('[') and host.endswith(']'):
+                host = host[1:-1]
+            if ':' in host:
+                continue  # IPv6; /proc/net/tcp does not list it either
+            if host == '127.0.0.1':
+                found.append('0100007F')
+            elif host in ('*', '0.0.0.0'):
+                found.append('00000000')
+            else:
+                found.append(host)
+            break
     return found
 
 
@@ -538,6 +575,88 @@ def stream_hash(path):
     return server.stream_hash(path)
 
 
+def _user_trash():
+    return Path.home() / '.Trash'
+
+
+def _find_in_user_trash(token, payload):
+    """Return the Trash entry this test created, matched by name and bytes."""
+    trash = _user_trash()
+    if not trash.is_dir():
+        return None
+    matches = []
+    for child in trash.iterdir():
+        if token not in child.name or not child.is_file():
+            continue
+        try:
+            data = child.read_bytes()
+        except OSError:
+            continue
+        if data == payload:
+            matches.append(child)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _delete_trash_named(token):
+    trash = _user_trash()
+    if not trash.is_dir():
+        return
+    for child in list(trash.iterdir()):
+        if token not in child.name:
+            continue
+        if child.is_file() or child.is_symlink():
+            child.unlink(missing_ok=True)
+        elif child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+
+
+def _put_back_blob(filename):
+    """Return the ~/.Trash/.DS_Store `ptbL` blob for filename, if recorded.
+
+    Finder's Put Back reads this bookmark of the original folder. A plain
+    rename into ~/.Trash does not write it. The record is not a public API;
+    callers that cannot see it should say so instead of assuming Put Back.
+    """
+    ds_path = _user_trash() / '.DS_Store'
+    if not ds_path.is_file():
+        return None
+    data = ds_path.read_bytes()
+    encoded = filename.encode('utf-16-be')
+    marker = struct.pack('>I', len(filename)) + encoded + b'ptbL'
+    idx = data.find(marker)
+    if idx < 0:
+        return None
+    type_at = idx + len(marker)
+    if data[type_at:type_at + 4] != b'blob':
+        return None
+    if type_at + 8 > len(data):
+        return None
+    length = struct.unpack('>I', data[type_at + 4:type_at + 8])[0]
+    end = type_at + 8 + length
+    if length > 1_000_000 or end > len(data):
+        return None
+    return data[type_at + 8:end]
+
+
+def _put_back_diagnostic(filename):
+    ds_path = _user_trash() / '.DS_Store'
+    if not ds_path.is_file():
+        return f'{ds_path} does not exist'
+    data = ds_path.read_bytes()
+    encoded = filename.encode('utf-16-be')
+    snippets = []
+    start = 0
+    while len(snippets) < 4:
+        i = data.find(encoded, start)
+        if i < 0:
+            break
+        snippets.append(data[max(0, i - 4):i + len(encoded) + 12].hex())
+        start = i + 1
+    return f'{ds_path} is {len(data)} bytes; filename windows: {snippets or "none"}'
+
+
 class MacTrashTests(unittest.TestCase):
     def test_macos_helper_leaves_the_file_alone_when_osascript_cannot_run(self):
         # On Linux, osascript is absent. The helper must not delete the file
@@ -552,6 +671,42 @@ class MacTrashTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(path.read_text(), 'stay')
             self.assertNotIn(str(path), result.get('argv_script', ''))
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Finder Trash only exists on macOS')
+    def test_macos_trash_moves_throwaway_file_into_user_trash(self):
+        # Home is the same volume as ~/.Trash, so NSFileManager does not
+        # divert the file to another volume's .Trashes folder.
+        token = uuid.uuid4().hex
+        folder = Path(tempfile.mkdtemp(prefix=f'filevault-ci-{token}-', dir=Path.home()))
+        try:
+            src = folder / f'{token}.txt'
+            payload = f'filevault-trash-{token}\n'.encode()
+            src.write_bytes(payload)
+            result = server.trash_items(
+                str(folder),
+                [{
+                    'path': str(src),
+                    'isDir': False,
+                    'size': src.stat().st_size,
+                    'mtimeMs': src.stat().st_mtime * 1000,
+                }],
+            )[0]
+            self.assertTrue(result['ok'], result)
+            self.assertFalse(src.exists(), 'file is still in the folder it was trashed from')
+            trashed = _find_in_user_trash(token, payload)
+            self.assertIsNotNone(trashed, f'{token} is not in {_user_trash()}')
+            self.assertEqual(trashed.read_bytes(), payload)
+            # Put Back is a Finder action. What a script can see is the
+            # ptbL bookmark trashItemAtURL writes into ~/.Trash/.DS_Store.
+            blob = _put_back_blob(trashed.name)
+            self.assertIsNotNone(
+                blob,
+                'no Put Back record for the trashed name; ' + _put_back_diagnostic(trashed.name),
+            )
+            self.assertIn(token.encode(), blob, 'Put Back bookmark does not name the original folder')
+        finally:
+            _delete_trash_named(token)
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 if __name__ == '__main__':
