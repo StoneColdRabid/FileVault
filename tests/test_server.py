@@ -70,19 +70,24 @@ def listening_v4(port):
 
 
 def set_xattr(path, name, value):
-    """Set an extended attribute when this Python can.
+    """Set an extended attribute.
 
-    CPython's os.setxattr is Linux-only. macOS builds do not provide it
-    (support is still an unmerged CPython change), so the metadata checks
-    below are skipped there and the rest of the test still runs.
+    Linux CPython has os.setxattr. macOS CPython does not, so those checks
+    use /usr/bin/xattr. A failure fails the test; it is not skipped.
     """
     if hasattr(os, 'setxattr'):
         os.setxattr(path, name, value)
+        return
+    if sys.platform == 'darwin':
+        xattr_set(path, name, value)
 
 
 def assert_xattr(test, path, name, value):
     if hasattr(os, 'getxattr'):
         test.assertEqual(os.getxattr(path, name), value)
+        return
+    if sys.platform == 'darwin':
+        test.assertEqual(xattr_get(path, name), value)
 
 
 # Finder stores a tag as a binary plist on this attribute. The value is a
@@ -136,6 +141,44 @@ def xattr_get(path, name):
     if len(hex_chars) % 2:
         raise ValueError(f'xattr -px returned odd-length hex: {proc.stdout!r}')
     return bytes.fromhex(hex_chars)
+
+
+def set_birthtime_ns(path, birth_ns):
+    """Set the creation time of a file or folder. macOS only."""
+    import ctypes
+
+    class AttrList(ctypes.Structure):
+        _fields_ = [
+            ('bitmapcount', ctypes.c_ushort),
+            ('reserved', ctypes.c_uint16),
+            ('commonattr', ctypes.c_uint32),
+            ('volattr', ctypes.c_uint32),
+            ('dirattr', ctypes.c_uint32),
+            ('fileattr', ctypes.c_uint32),
+            ('forkattr', ctypes.c_uint32),
+        ]
+
+    class TimeSpec(ctypes.Structure):
+        _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+
+    sec, nsec = divmod(int(birth_ns), 1_000_000_000)
+    lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    lib.setattrlist.argtypes = [
+        ctypes.c_char_p, ctypes.POINTER(AttrList), ctypes.c_void_p,
+        ctypes.c_size_t, ctypes.c_ulong,
+    ]
+    lib.setattrlist.restype = ctypes.c_int
+    attrs = AttrList()
+    attrs.bitmapcount = 5
+    attrs.commonattr = 0x00000200  # ATTR_CMN_CRTIME
+    spec = TimeSpec(sec, nsec)
+    result = lib.setattrlist(
+        os.fsencode(path), ctypes.byref(attrs), ctypes.byref(spec),
+        ctypes.sizeof(spec), 1,
+    )
+    if result != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err) or 'setattrlist failed', str(path))
 
 
 class ServerTestCase(unittest.TestCase):
@@ -444,6 +487,7 @@ class FileOperationTests(unittest.TestCase):
         com.apple.metadata:_kMDItemUserTags. The comment is the plist Finder
         writes on com.apple.metadata:kMDItemFinderComment. Both are set with
         /usr/bin/xattr, then copied through write_copy (the /api/write/copy path).
+        Creation time is set to a fixed past instant so it cannot match by chance.
         """
         tag = plistlib.dumps(['Red\n6'], fmt=plistlib.FMT_BINARY)
         comment = plistlib.dumps('Quarterly receipt', fmt=plistlib.FMT_BINARY)
@@ -451,11 +495,14 @@ class FileOperationTests(unittest.TestCase):
         src.write_bytes(b'tagged-bytes')
         xattr_set(src, FINDER_TAG_ATTR, tag)
         xattr_set(src, FINDER_COMMENT_ATTR, comment)
+        set_birthtime_ns(src, 1_000_000_000_000_000_000 + 123_456_789)
+        os.utime(src, ns=(1_700_000_000_000_000_000, 1_700_000_100_000_000_000))
         stored_tag = xattr_get(src, FINDER_TAG_ATTR)
         stored_comment = xattr_get(src, FINDER_COMMENT_ATTR)
         self.assertIsNotNone(stored_tag, 'Finder tag was not stored on the source')
         self.assertEqual(plistlib.loads(stored_tag), ['Red\n6'])
         self.assertEqual(plistlib.loads(stored_comment), 'Quarterly receipt')
+        self.assertLess(src.stat().st_birthtime_ns // 1_000_000_000, 1_100_000_000)
 
         dest = self.root / 'dest'
         dest.mkdir()
@@ -468,6 +515,9 @@ class FileOperationTests(unittest.TestCase):
             self.assertEqual(xattr_get(copied, FINDER_TAG_ATTR), stored_tag)
         with self.subTest('finder comment'):
             self.assertEqual(xattr_get(copied, FINDER_COMMENT_ATTR), stored_comment)
+        with self.subTest('file creation time'):
+            self.assertEqual(copied.stat().st_birthtime_ns, src.stat().st_birthtime_ns)
+        self.assertEqual(copied.stat().st_mtime_ns, src.stat().st_mtime_ns)
 
         folder = self.root / 'tagged-dir'
         folder.mkdir()
@@ -475,6 +525,10 @@ class FileOperationTests(unittest.TestCase):
         inner.write_text('inside')
         xattr_set(inner, FINDER_TAG_ATTR, tag)
         xattr_set(folder, FINDER_TAG_ATTR, tag)
+        set_birthtime_ns(inner, 1_000_000_000_000_000_000 + 222)
+        set_birthtime_ns(folder, 1_000_000_000_000_000_000 + 333)
+        os.utime(inner, ns=(1_600_000_000_000_000_000, 1_600_000_060_000_000_000))
+        os.utime(folder, ns=(1_600_000_000_000_000_000, 1_600_000_050_000_000_000))
         inner_tag = xattr_get(inner, FINDER_TAG_ATTR)
         folder_tag = xattr_get(folder, FINDER_TAG_ATTR)
         self.assertEqual(plistlib.loads(inner_tag), ['Red\n6'])
@@ -484,11 +538,18 @@ class FileOperationTests(unittest.TestCase):
         folder_result = server.write_copy(str(self.root), str(folder), str(folder_dest))
         self.assertTrue(folder_result['ok'], folder_result)
         copied_folder = Path(folder_result['path'])
-        self.assertEqual((copied_folder / 'inner.txt').read_text(), 'inside')
+        copied_inner = copied_folder / 'inner.txt'
+        self.assertEqual(copied_inner.read_text(), 'inside')
         with self.subTest('tagged file inside a copied folder'):
-            self.assertEqual(xattr_get(copied_folder / 'inner.txt', FINDER_TAG_ATTR), inner_tag)
+            self.assertEqual(xattr_get(copied_inner, FINDER_TAG_ATTR), inner_tag)
         with self.subTest('tag on the copied folder'):
             self.assertEqual(xattr_get(copied_folder, FINDER_TAG_ATTR), folder_tag)
+        with self.subTest('creation time inside a copied folder'):
+            self.assertEqual(copied_inner.stat().st_birthtime_ns, inner.stat().st_birthtime_ns)
+        with self.subTest('creation time of the copied folder'):
+            self.assertEqual(copied_folder.stat().st_birthtime_ns, folder.stat().st_birthtime_ns)
+        self.assertEqual(copied_inner.stat().st_mtime_ns, inner.stat().st_mtime_ns)
+        self.assertEqual(copied_folder.stat().st_mtime_ns, folder.stat().st_mtime_ns)
 
     def test_move_same_folder_does_not_delete_or_rename(self):
         src = self.root / 'keep.txt'
