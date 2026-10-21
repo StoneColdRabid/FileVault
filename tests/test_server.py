@@ -9,26 +9,79 @@ import json
 import os
 import shutil
 import stat
+import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 
 import server
 
 
 def listening_v4(port):
-    """Return raw local addresses from /proc/net/tcp that are LISTEN on port."""
-    hexport = f'{port:04X}'
+    """Return raw local IPv4 addresses that are LISTEN on port.
+
+    On Linux these are the little-endian hex addresses from /proc/net/tcp
+    (127.0.0.1 is 0100007F, 0.0.0.0 is 00000000). macOS has no /proc, so the
+    same two values are derived from lsof. Other addresses are returned as
+    text so a non-loopback listener still fails the assertion.
+    """
+    if Path('/proc/net/tcp').exists():
+        hexport = f'{port:04X}'
+        found = []
+        text = Path('/proc/net/tcp').read_text().splitlines()[1:]
+        for line in text:
+            parts = line.split()
+            local, state = parts[1], parts[3]
+            ip, pt = local.split(':')
+            if pt.upper() == hexport and state == '0A':
+                found.append(ip.upper())
+        return found
+    proc = subprocess.run(
+        ['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode not in (0, 1):
+        raise OSError(proc.stderr.strip() or f'lsof exited {proc.returncode}')
     found = []
-    text = Path('/proc/net/tcp').read_text().splitlines()[1:]
-    for line in text:
-        parts = line.split()
-        local, state = parts[1], parts[3]
-        ip, pt = local.split(':')
-        if pt.upper() == hexport and state == '0A':
-            found.append(ip.upper())
+    for line in proc.stdout.splitlines()[1:]:
+        for part in line.split():
+            host, sep, port_s = part.rpartition(':')
+            if not sep or port_s != str(port):
+                continue
+            if host.startswith('[') and host.endswith(']'):
+                host = host[1:-1]
+            if ':' in host:
+                continue  # IPv6; /proc/net/tcp does not list it either
+            if host == '127.0.0.1':
+                found.append('0100007F')
+            elif host in ('*', '0.0.0.0'):
+                found.append('00000000')
+            else:
+                found.append(host)
+            break
     return found
+
+
+def set_xattr(path, name, value):
+    """Set an extended attribute when this Python can.
+
+    CPython's os.setxattr is Linux-only. macOS builds do not provide it
+    (support is still an unmerged CPython change), so the metadata checks
+    below are skipped there and the rest of the test still runs.
+    """
+    if hasattr(os, 'setxattr'):
+        os.setxattr(path, name, value)
+
+
+def assert_xattr(test, path, name, value):
+    if hasattr(os, 'getxattr'):
+        test.assertEqual(os.getxattr(path, name), value)
 
 
 class ServerTestCase(unittest.TestCase):
@@ -275,7 +328,7 @@ class FileOperationTests(unittest.TestCase):
         src.write_bytes(b'source-bytes')
         os.chmod(src, 0o640)
         os.utime(src, (1_700_000_000, 1_700_000_000))
-        os.setxattr(src, 'user.test', b'tag')
+        set_xattr(src, 'user.test', b'tag')
         dest_dir = self.root / 'dest'
         dest_dir.mkdir()
         existing = dest_dir / 'a.txt'
@@ -295,7 +348,7 @@ class FileOperationTests(unittest.TestCase):
         self.assertNotEqual(src.stat().st_ino, copied.stat().st_ino)
         self.assertEqual(src.stat().st_mtime, copied.stat().st_mtime)
         self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o640)
-        self.assertEqual(os.getxattr(copied, 'user.test'), b'tag')
+        assert_xattr(self, copied, 'user.test', b'tag')
         self.assertTrue(src.exists())
 
     def test_copy_same_folder_does_not_truncate_the_file(self):
@@ -332,21 +385,21 @@ class FileOperationTests(unittest.TestCase):
     def test_move_same_folder_does_not_delete_or_rename(self):
         src = self.root / 'keep.txt'
         src.write_text('keepme')
-        os.setxattr(src, 'user.tag', b'blue')
+        set_xattr(src, 'user.tag', b'blue')
         ino = src.stat().st_ino
         result = server.write_move(str(self.root), str(src), str(self.root))
         self.assertFalse(result['ok'])
         self.assertTrue(src.exists())
         self.assertEqual(src.read_text(), 'keepme')
         self.assertEqual(src.stat().st_ino, ino)
-        self.assertEqual(os.getxattr(src, 'user.tag'), b'blue')
+        assert_xattr(self, src, 'user.tag', b'blue')
         self.assertFalse(list(self.root.glob('keep (*).txt')))
 
     def test_move_refuses_existing_name_and_preserves_metadata(self):
         src = self.root / 'move-me.txt'
         src.write_text('payload')
         os.utime(src, (1_700_000_000, 1_711_111_111))
-        os.setxattr(src, 'user.tag', b'green')
+        set_xattr(src, 'user.tag', b'green')
         dest = self.root / 'dest'
         dest.mkdir()
         (dest / 'move-me.txt').write_text('already')
@@ -364,7 +417,7 @@ class FileOperationTests(unittest.TestCase):
         self.assertEqual(target.read_text(), 'payload')
         self.assertEqual(target.stat().st_ino, ino)
         self.assertEqual(target.stat().st_mtime, 1_711_111_111)
-        self.assertEqual(os.getxattr(target, 'user.tag'), b'green')
+        assert_xattr(self, target, 'user.tag', b'green')
 
     def test_move_folder_into_itself_is_refused(self):
         folder = self.root / 'tree'
@@ -379,7 +432,7 @@ class FileOperationTests(unittest.TestCase):
     def test_rename_preserves_inode_xattrs_and_refuses_collisions(self):
         src = self.root / 'old.txt'
         src.write_text('body')
-        os.setxattr(src, 'user.tag', b'red')
+        set_xattr(src, 'user.tag', b'red')
         other = self.root / 'taken.txt'
         other.write_text('taken')
         ino = src.stat().st_ino
@@ -392,7 +445,7 @@ class FileOperationTests(unittest.TestCase):
         self.assertTrue(renamed['ok'], renamed)
         target = Path(renamed['path'])
         self.assertEqual(target.stat().st_ino, ino)
-        self.assertEqual(os.getxattr(target, 'user.tag'), b'red')
+        assert_xattr(self, target, 'user.tag', b'red')
         self.assertFalse(src.exists())
 
     def test_rename_rejects_path_separators_and_overlong_names(self):
@@ -408,7 +461,7 @@ class FileOperationTests(unittest.TestCase):
         # A few megabytes is enough to show this is a rename: the inode is kept
         # and the operation does not depend on loading the bytes in Python.
         big.write_bytes(b'x' * (3 * 1024 * 1024))
-        os.setxattr(big, 'user.tag', b'keep')
+        set_xattr(big, 'user.tag', b'keep')
         ino = big.stat().st_ino
         result = server.trash_items(
             str(self.root),
@@ -420,7 +473,7 @@ class FileOperationTests(unittest.TestCase):
         trashed = Path(result['trashedPath'])
         self.assertEqual(trashed.stat().st_ino, ino)
         self.assertEqual(trashed.stat().st_size, 3 * 1024 * 1024)
-        self.assertEqual(os.getxattr(trashed, 'user.tag'), b'keep')
+        assert_xattr(self, trashed, 'user.tag', b'keep')
 
         folder = self.root / 'box'
         folder.mkdir()
@@ -538,6 +591,96 @@ def stream_hash(path):
     return server.stream_hash(path)
 
 
+def _user_trash():
+    return Path.home() / '.Trash'
+
+
+def _find_in_user_trash(token, payload):
+    """Return the Trash entry this test created, matched by name and bytes."""
+    trash = _user_trash()
+    if not trash.is_dir():
+        return None
+    matches = []
+    for child in trash.iterdir():
+        if token not in child.name or not child.is_file():
+            continue
+        try:
+            data = child.read_bytes()
+        except OSError:
+            continue
+        if data == payload:
+            matches.append(child)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _delete_trash_named(token):
+    trash = _user_trash()
+    if not trash.is_dir():
+        return
+    for child in list(trash.iterdir()):
+        if token not in child.name:
+            continue
+        if child.is_file() or child.is_symlink():
+            child.unlink(missing_ok=True)
+        elif child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+
+
+def _put_back_location(filename):
+    """Return the original folder Finder recorded for a Trash filename.
+
+    `trashItemAtURL` writes a `ptbL` record into ~/.Trash/.DS_Store. On
+    current macOS that value is a `ustr` (UTF-16-BE path of the original
+    folder). Older stores may use a `blob` bookmark; those bytes are
+    returned unchanged. A plain rename into ~/.Trash does not write `ptbL`.
+    """
+    ds_path = _user_trash() / '.DS_Store'
+    if not ds_path.is_file():
+        return None
+    data = ds_path.read_bytes()
+    encoded = filename.encode('utf-16-be')
+    marker = struct.pack('>I', len(filename)) + encoded + b'ptbL'
+    idx = data.find(marker)
+    if idx < 0:
+        return None
+    type_at = idx + len(marker)
+    if type_at + 8 > len(data):
+        return None
+    dtype = data[type_at:type_at + 4]
+    length = struct.unpack('>I', data[type_at + 4:type_at + 8])[0]
+    if dtype == b'ustr':
+        nbytes = length * 2
+        end = type_at + 8 + nbytes
+        if length > 100_000 or end > len(data):
+            return None
+        return data[type_at + 8:end].decode('utf-16-be')
+    if dtype == b'blob':
+        end = type_at + 8 + length
+        if length > 1_000_000 or end > len(data):
+            return None
+        return data[type_at + 8:end]
+    return None
+
+
+def _put_back_diagnostic(filename):
+    ds_path = _user_trash() / '.DS_Store'
+    if not ds_path.is_file():
+        return f'{ds_path} does not exist'
+    data = ds_path.read_bytes()
+    encoded = filename.encode('utf-16-be')
+    snippets = []
+    start = 0
+    while len(snippets) < 4:
+        i = data.find(encoded, start)
+        if i < 0:
+            break
+        snippets.append(data[max(0, i - 4):i + len(encoded) + 12].hex())
+        start = i + 1
+    return f'{ds_path} is {len(data)} bytes; filename windows: {snippets or "none"}'
+
+
 class MacTrashTests(unittest.TestCase):
     def test_macos_helper_leaves_the_file_alone_when_osascript_cannot_run(self):
         # On Linux, osascript is absent. The helper must not delete the file
@@ -552,6 +695,50 @@ class MacTrashTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertEqual(path.read_text(), 'stay')
             self.assertNotIn(str(path), result.get('argv_script', ''))
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Finder Trash only exists on macOS')
+    def test_macos_trash_moves_throwaway_file_into_user_trash(self):
+        # Home is the same volume as ~/.Trash, so NSFileManager does not
+        # divert the file to another volume's .Trashes folder.
+        token = uuid.uuid4().hex
+        folder = Path(tempfile.mkdtemp(prefix=f'filevault-ci-{token}-', dir=Path.home()))
+        try:
+            src = folder / f'{token}.txt'
+            payload = f'filevault-trash-{token}\n'.encode()
+            src.write_bytes(payload)
+            result = server.trash_items(
+                str(folder),
+                [{
+                    'path': str(src),
+                    'isDir': False,
+                    'size': src.stat().st_size,
+                    'mtimeMs': src.stat().st_mtime * 1000,
+                }],
+            )[0]
+            self.assertTrue(result['ok'], result)
+            self.assertFalse(src.exists(), 'file is still in the folder it was trashed from')
+            trashed = _find_in_user_trash(token, payload)
+            self.assertIsNotNone(trashed, f'{token} is not in {_user_trash()}')
+            self.assertEqual(trashed.read_bytes(), payload)
+            # Put Back itself is a Finder menu. The script-visible record is
+            # the original folder path in ~/.Trash/.DS_Store (ptbL / ustr).
+            location = _put_back_location(trashed.name)
+            self.assertIsNotNone(
+                location,
+                'no Put Back record for the trashed name; ' + _put_back_diagnostic(trashed.name),
+            )
+            if isinstance(location, str):
+                # The record is the original folder. Current macOS writes it
+                # without a leading slash (Users/name/...), so root it before
+                # comparing. A relative Path.resolve() would use the cwd.
+                text = location.split('\x00', 1)[0]
+                rooted = Path(text if text.startswith('/') else '/' + text)
+                self.assertEqual(rooted.resolve(), folder.resolve(), f'Put Back record was {location!r}')
+            else:
+                self.assertIn(token.encode(), location)
+        finally:
+            _delete_trash_named(token)
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 if __name__ == '__main__':

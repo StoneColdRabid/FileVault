@@ -67,6 +67,8 @@ python3 -m unittest discover -s tests -v
 node tests/page_logic_test.mjs
 ```
 
+GitHub Actions runs those checks, plus `node --check` on the page script, on Linux and macOS.
+
 ## Data safety
 
 These are real filesystem operations.

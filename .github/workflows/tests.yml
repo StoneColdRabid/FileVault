@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Python tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Page logic
+        run: node tests/page_logic_test.mjs
+      - name: Page script syntax
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          html = Path('FileVault.html').read_text()
+          start = html.index('<script>') + len('<script>')
+          end = html.index('</script>', start)
+          script = html[start:end]
+          if '<script' in script:
+              raise SystemExit('expected a single page script')
+          Path('/tmp/filevault-page.js').write_text(script)
+          PY
+          node --check /tmp/filevault-page.js
